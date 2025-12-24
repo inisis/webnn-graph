@@ -28,6 +28,72 @@ This file is intended to be:
 - Easy to diff and review
 - Stable across weight updates
 
+Its EBNF-like grammar:
+
+```
+document      = ws, graph_decl, ws ;
+
+graph_decl    = "webnn_graph", ws, string, ws, version, ws, "{",
+                ws, section*, ws, "}", ws ;
+
+version       = "v", int ;
+
+section       = inputs_section
+              | consts_section
+              | nodes_section
+              | outputs_section ;
+
+inputs_section  = "inputs", ws, "{", ws, input_decl*, ws, "}", ws ;
+consts_section  = "consts", ws, "{", ws, const_decl*, ws, "}", ws ;
+nodes_section   = "nodes",  ws, "{", ws, node_stmt*,  ws, "}", ws ;
+outputs_section = "outputs", ws, "{", ws, output_list, ws, "}", ws ;
+
+input_decl    = ident, ws, ":", ws, tensor_type, ws, ";", ws ;
+
+const_decl    = ident, ws, ":", ws, tensor_type, ws, init?, ws, ";", ws ;
+
+init          = ws, "@weights", ws, "(", ws, string, ws, ")" ;
+
+node_stmt     = ident, ws, "=", ws, call, ws, ";", ws ;
+
+call          = ident, ws, "(", ws, arg_list?, ws, ")", ws ;
+
+arg_list      = expr, (ws, ",", ws, expr)*, (ws, ",")? ;
+
+expr          = ident
+              | number
+              | string
+              | list
+              | named_arg ;
+
+named_arg     = ident, ws, "=", ws, expr ;
+
+list          = "[", ws, (expr, (ws, ",", ws, expr)*)?, ws, "]" ;
+
+output_list   = ident, ws, ";", ws, (ident, ws, ";", ws)* ;
+
+tensor_type   = dtype, ws, "[", ws, dims?, ws, "]" ;
+
+dims          = dim, (ws, ",", ws, dim)* ;
+
+dim           = int ;        (* or ident for symbolic dims if you support that *)
+
+dtype         = "f32" | "f16"
+              | "i32" | "u32"
+              | "i64" | "u64"
+              | "i8"  | "u8" ;
+
+ident         = (alpha | "_"), (alnum | "_" )* ;
+string        = "\"", { char - "\"" }, "\"" ;
+number        = int | float ;
+
+int           = digit, digit* ;
+float         = digit, digit*, ".", digit, digit* ;
+
+ws            = { " " | "\t" | "\r" | "\n" | comment } ;
+comment       = ("#" | "//"), { char - "\n" }, ("\n" | eof) ;
+```
+
 ### 2. Weights manifest (`.manifest.json`, optional)
 
 If the graph references external weights using `@weights("key")`, a manifest file can be provided to:
@@ -67,18 +133,16 @@ Once parsed, the AST can be:
 - Transformed
 - Used to construct a WebNN graph
 
-### Using the AST
+## Using the AST
 
 The AST is designed to be easy to consume from other tools. In particular, it can be used to:
 
-- Build a WebNN graph using **rustnn**
-- Build a WebNN graph using **PyWebNN**
+- load, save a build an WebNN graph and its weights using **rustnn** or **PyWebNN**
 - Generate WebNN JavaScript `MLGraphBuilder` calls
 - Perform lightweight graph analysis or transformations
 
-The library does not attempt to deeply re-specify WebNN semantics. Anything not explicitly checked is passed through and left to the WebNN runtime to validate.
-
----
+The library does not attempt to deeply re-specify WebNN semantics. Anything not
+explicitly checked is passed through and left to the WebNN runtime to validate.
 
 ## JSON Serialization (Secondary)
 
@@ -145,7 +209,9 @@ dtype[dim0, dim1, ...]
 
 Supported dtypes: `f32`, `f16`, `i32`, `u32`,`i64`, `u64`, `i8`, `u8`.
 
-## Example
+## Examples
+
+Below is the same graph expressed in webnn and JSON.
 
 ### Text 
 
@@ -200,7 +266,7 @@ webnn_graph "resnet_head" v1 {
 }
 ```
 
-# Notes
+## Notes
 
 - Validation is intentionally lightweight and structural.
 - Operator semantics are mostly pass-through.
