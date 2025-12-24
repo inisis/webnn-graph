@@ -230,6 +230,197 @@ pub fn create_manifest(input_dir: &str, output_path: &str, endianness: &str) -> 
     Ok(())
 }
 
+/// Extract inline weights from a graph and save them as external files
+pub fn extract_weights(
+    graph: &crate::ast::GraphJson,
+    output_dir: &str,
+    weights_file: &str,
+    manifest_file: &str,
+) -> Result<crate::ast::GraphJson> {
+    use crate::ast::{ConstDecl, ConstInit};
+
+    // Create output directory for tensors
+    let tensor_dir = Path::new(output_dir).join("tensors");
+    fs::create_dir_all(&tensor_dir).context("Failed to create tensor directory")?;
+
+    let mut manifest_tensors = BTreeMap::new();
+    let mut new_consts = BTreeMap::new();
+    let mut current_offset = 8u64; // After magic + version
+
+    // Process each const
+    for (name, const_decl) in &graph.consts {
+        match &const_decl.init {
+            ConstInit::InlineBytes { bytes } => {
+                // Validate byte count matches expected size
+                let expected_size = numel(&const_decl.shape) * dtype_size(&const_decl.data_type);
+                if bytes.len() as u64 != expected_size {
+                    bail!(
+                        "Const '{}' has wrong byte count: expected {}, got {}",
+                        name,
+                        expected_size,
+                        bytes.len()
+                    );
+                }
+
+                // Write tensor to file
+                let tensor_path = tensor_dir.join(format!("{}.bin", name));
+                fs::write(&tensor_path, bytes)
+                    .with_context(|| format!("Failed to write tensor file: {:?}", tensor_path))?;
+
+                // Add to manifest
+                manifest_tensors.insert(
+                    name.clone(),
+                    TensorEntry {
+                        data_type: const_decl.data_type.clone(),
+                        shape: const_decl.shape.clone(),
+                        byte_offset: current_offset,
+                        byte_length: bytes.len() as u64,
+                        layout: Some("row-major".to_string()),
+                    },
+                );
+
+                current_offset += bytes.len() as u64;
+
+                // Create new const with weights reference
+                new_consts.insert(
+                    name.clone(),
+                    ConstDecl {
+                        data_type: const_decl.data_type.clone(),
+                        shape: const_decl.shape.clone(),
+                        init: ConstInit::Weights {
+                            r#ref: name.clone(),
+                        },
+                    },
+                );
+
+                eprintln!(
+                    "Extracted tensor '{}': {} bytes ({:?}, shape={:?})",
+                    name,
+                    bytes.len(),
+                    const_decl.data_type,
+                    const_decl.shape
+                );
+            }
+            _ => {
+                // Keep non-inline consts as-is
+                new_consts.insert(name.clone(), const_decl.clone());
+            }
+        }
+    }
+
+    // Create manifest
+    let manifest = WeightsManifest {
+        format: "wg-weights-manifest".to_string(),
+        version: 1,
+        endianness: "little".to_string(),
+        tensors: manifest_tensors,
+    };
+
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    fs::write(manifest_file, manifest_json).context("Failed to write manifest file")?;
+
+    eprintln!(
+        "Created manifest with {} tensors: {}",
+        manifest.tensors.len(),
+        manifest_file
+    );
+
+    // Pack weights
+    pack_weights(manifest_file, tensor_dir.to_str().unwrap(), weights_file)?;
+
+    // Return new graph with weights references
+    let mut new_graph = graph.clone();
+    new_graph.consts = new_consts;
+
+    Ok(new_graph)
+}
+
+/// Inline external weights into a graph
+pub fn inline_weights(
+    graph: &crate::ast::GraphJson,
+    weights_file: &str,
+    manifest_file: &str,
+) -> Result<crate::ast::GraphJson> {
+    use crate::ast::{ConstDecl, ConstInit};
+
+    // Read manifest
+    let manifest_text =
+        fs::read_to_string(manifest_file).context("Failed to read manifest file")?;
+    let manifest: WeightsManifest =
+        serde_json::from_str(&manifest_text).context("Failed to parse manifest JSON")?;
+
+    // Read weights file
+    let mut weights_file_handle =
+        File::open(weights_file).context("Failed to open weights file")?;
+
+    // Read and validate header
+    let mut magic = [0u8; 4];
+    weights_file_handle.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        bail!("Invalid magic bytes in weights file");
+    }
+
+    let mut version_bytes = [0u8; 4];
+    weights_file_handle.read_exact(&mut version_bytes)?;
+    let version = u32::from_le_bytes(version_bytes);
+    if version != VERSION {
+        bail!("Unsupported weights file version: {}", version);
+    }
+
+    // Read all weight data
+    let mut weights_data = Vec::new();
+    weights_file_handle.read_to_end(&mut weights_data)?;
+
+    // Process consts
+    let mut new_consts = BTreeMap::new();
+
+    for (name, const_decl) in &graph.consts {
+        match &const_decl.init {
+            ConstInit::Weights { r#ref } => {
+                // Look up in manifest
+                let entry = manifest.tensors.get(r#ref).with_context(|| {
+                    format!("Weight reference '{}' not found in manifest", r#ref)
+                })?;
+
+                // Extract bytes from weights file
+                let start = (entry.byte_offset - 8) as usize; // Subtract header
+                let end = start + entry.byte_length as usize;
+
+                if end > weights_data.len() {
+                    bail!("Weight reference '{}' extends beyond weights file", r#ref);
+                }
+
+                let bytes = weights_data[start..end].to_vec();
+
+                // Create new const with inline bytes
+                new_consts.insert(
+                    name.clone(),
+                    ConstDecl {
+                        data_type: const_decl.data_type.clone(),
+                        shape: const_decl.shape.clone(),
+                        init: ConstInit::InlineBytes { bytes },
+                    },
+                );
+
+                eprintln!(
+                    "Inlined tensor '{}': {} bytes ({:?}, shape={:?})",
+                    name, entry.byte_length, entry.data_type, entry.shape
+                );
+            }
+            _ => {
+                // Keep non-weight consts as-is
+                new_consts.insert(name.clone(), const_decl.clone());
+            }
+        }
+    }
+
+    // Return new graph with inlined bytes
+    let mut new_graph = graph.clone();
+    new_graph.consts = new_consts;
+
+    Ok(new_graph)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

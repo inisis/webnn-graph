@@ -7,7 +7,9 @@ use webnn_graph::parser::parse_wg_text;
 use webnn_graph::serialize::serialize_graph_to_wg_text;
 use webnn_graph::validate::{validate_graph, validate_weights};
 use webnn_graph::weights::WeightsManifest;
-use webnn_graph::weights_io::{create_manifest, pack_weights, unpack_weights};
+use webnn_graph::weights_io::{
+    create_manifest, extract_weights, inline_weights, pack_weights, unpack_weights,
+};
 
 #[derive(Parser)]
 #[command(name = "webnn-graph")]
@@ -56,6 +58,28 @@ enum Command {
         output: String,
         #[arg(long, default_value = "little")]
         endianness: String,
+    },
+    ExtractWeights {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        output_dir: String,
+        #[arg(long)]
+        weights: String,
+        #[arg(long)]
+        manifest: String,
+        #[arg(long)]
+        output_graph: String,
+    },
+    InlineWeights {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        weights: String,
+        #[arg(long)]
+        manifest: String,
+        #[arg(long)]
+        output: String,
     },
 }
 
@@ -137,6 +161,31 @@ fn main() -> anyhow::Result<()> {
             endianness,
         } => {
             create_manifest(&input_dir, &output, &endianness)?;
+        }
+        Command::ExtractWeights {
+            input,
+            output_dir,
+            weights,
+            manifest,
+            output_graph,
+        } => {
+            let g = load_graph(&input)?;
+            let new_graph = extract_weights(&g, &output_dir, &weights, &manifest)?;
+            let json = serde_json::to_string_pretty(&new_graph)?;
+            fs::write(&output_graph, json)?;
+            eprintln!("Wrote graph with weight references to: {}", output_graph);
+        }
+        Command::InlineWeights {
+            input,
+            weights,
+            manifest,
+            output,
+        } => {
+            let g = load_graph(&input)?;
+            let new_graph = inline_weights(&g, &weights, &manifest)?;
+            let json = serde_json::to_string_pretty(&new_graph)?;
+            fs::write(&output, json)?;
+            eprintln!("Wrote graph with inline weights to: {}", output);
         }
     }
 
