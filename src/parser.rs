@@ -542,8 +542,8 @@ webnn_graph "test" v1 {
         let int_val = parse_number_value("42");
         assert_eq!(int_val.as_i64().unwrap(), 42);
 
-        let float_val = parse_number_value("3.14");
-        assert_eq!(float_val.as_f64().unwrap(), 3.14);
+        let float_val = parse_number_value("3.12");
+        assert_eq!(float_val.as_f64().unwrap(), 3.12);
 
         let sci_val = parse_number_value("1e-3");
         assert_eq!(sci_val.as_f64().unwrap(), 0.001);
