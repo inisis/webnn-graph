@@ -3,6 +3,7 @@
 Rust implementation for a WebNN-oriented graph DSL:
 
 - Parse WebNN graph text (`.webnn`) to canonical JSON
+- Serialize JSON back to WebNN text format (full round-trip support)
 - Validate structure plus optional weights manifest
 - Emit WebNN JavaScript builder code (WebNN MLGraphBuilder calls)
 
@@ -59,7 +60,7 @@ f32, f16, i32, u32, i64, u64, i8, u8.
 
 ### JSON format: .json
 
-The JSON format is canonical (stable for tooling, easy to diff). The text format is sugar over JSON.
+The JSON format is **10x larger** than .webnn but useful for programmatic manipulation. All CLI commands auto-detect and accept both formats. Use JSON when you need to manipulate graphs programmatically in other tools/languages. The JSON format optionally stores the graph name and supports full round-trip conversion back to .webnn.
 
 ## Small example
 
@@ -149,36 +150,42 @@ If you use @weights("key") in .webnn, you can validate the mapping using a manif
 
 ## CLI
 
+**All commands accept both .webnn and .json formats** (auto-detected). **.webnn is the primary format** (10x smaller than JSON).
+
 ### Graph Operations
 
-Parse graph text (.webnn) to JSON:
-
-```bash
-make parse
-# Or directly:
-webnn-graph parse examples/resnet_head.webnn > graph.json
-```
-
-Validate JSON:
-
-```bash
-webnn-graph validate graph.json
-```
-
-Validate JSON plus weights manifest consistency:
+Validate graph structure:
 
 ```bash
 make validate
 # Or directly:
-webnn-graph validate graph.json --weights-manifest examples/weights.manifest.json
+webnn-graph validate examples/resnet_head.webnn
+webnn-graph validate model.webnn --weights-manifest weights.manifest.json
 ```
 
-Emit WebNN JS builder code (includes WeightsFile helper):
+Emit WebNN JS builder code:
 
 ```bash
 make emit-js
 # Or directly:
-webnn-graph emit-js graph.json > buildGraph.js
+webnn-graph emit-js examples/resnet_head.webnn > buildGraph.js
+```
+
+### Format Conversions (Optional)
+
+Parse .webnn to JSON (for programmatic manipulation):
+
+```bash
+webnn-graph parse examples/resnet_head.webnn > graph.json
+```
+
+Serialize JSON back to .webnn (for human editing):
+
+```bash
+webnn-graph serialize graph.json > model.webnn
+
+# Complete round-trip:
+webnn-graph parse model.webnn | webnn-graph serialize /dev/stdin > model_copy.webnn
 ```
 
 ### Weights Management

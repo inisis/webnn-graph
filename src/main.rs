@@ -4,6 +4,7 @@ use std::fs;
 use webnn_graph::ast::GraphJson;
 use webnn_graph::emit_js::{emit_builder_js, emit_weights_loader_js};
 use webnn_graph::parser::parse_wg_text;
+use webnn_graph::serialize::serialize_graph_to_wg_text;
 use webnn_graph::validate::{validate_graph, validate_weights};
 use webnn_graph::weights::WeightsManifest;
 use webnn_graph::weights_io::{create_manifest, pack_weights, unpack_weights};
@@ -27,6 +28,9 @@ enum Command {
         weights_manifest: Option<String>,
     },
     EmitJs {
+        path: String,
+    },
+    Serialize {
         path: String,
     },
     PackWeights {
@@ -55,6 +59,23 @@ enum Command {
     },
 }
 
+/// Load a graph from either .webnn text format or JSON format (auto-detect)
+fn load_graph(path: &str) -> anyhow::Result<GraphJson> {
+    let content = fs::read_to_string(path)?;
+    let trimmed = content.trim_start();
+
+    // Auto-detect format: .webnn starts with "webnn_graph", JSON starts with "{"
+    if trimmed.starts_with("webnn_graph") {
+        Ok(parse_wg_text(&content)?)
+    } else if trimmed.starts_with('{') {
+        Ok(serde_json::from_str(&content)?)
+    } else {
+        Err(anyhow::anyhow!(
+            "Unknown format: file must be .webnn text (starts with 'webnn_graph') or JSON (starts with '{{')"
+        ))
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -68,8 +89,7 @@ fn main() -> anyhow::Result<()> {
             path,
             weights_manifest,
         } => {
-            let txt = fs::read_to_string(path)?;
-            let g: GraphJson = serde_json::from_str(&txt)?;
+            let g = load_graph(&path)?;
             validate_graph(&g)?;
 
             if let Some(mpath) = weights_manifest {
@@ -80,8 +100,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("OK");
         }
         Command::EmitJs { path } => {
-            let txt = fs::read_to_string(path)?;
-            let g: GraphJson = serde_json::from_str(&txt)?;
+            let g = load_graph(&path)?;
             validate_graph(&g)?;
 
             // Emit WeightsFile helper class
@@ -91,6 +110,12 @@ fn main() -> anyhow::Result<()> {
             // Emit buildGraph function
             let js = emit_builder_js(&g);
             print!("{js}");
+        }
+        Command::Serialize { path } => {
+            let txt = fs::read_to_string(path)?;
+            let g: GraphJson = serde_json::from_str(&txt)?;
+            let wg_text = serialize_graph_to_wg_text(&g)?;
+            print!("{}", wg_text);
         }
         Command::PackWeights {
             manifest,

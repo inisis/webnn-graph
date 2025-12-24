@@ -39,6 +39,15 @@ pub fn parse_wg_text(input: &str) -> Result<GraphJson, ParseError> {
 
     for p in file.into_inner() {
         match p.as_rule() {
+            Rule::header => {
+                // Extract graph name from header
+                for inner in p.into_inner() {
+                    if inner.as_rule() == Rule::string {
+                        g.name = Some(unquote(inner.as_str()));
+                        break;
+                    }
+                }
+            }
             Rule::inputs_block => parse_inputs_block(p, &mut g.inputs)?,
             Rule::consts_block => parse_consts_block(p, &mut g.consts)?,
             Rule::nodes_block => parse_nodes_block(p, &mut nodes)?,

@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 webnn-graph is a Rust implementation for a WebNN-oriented graph DSL. It provides a complete pipeline:
 1. Parse WebNN graph text files (.webnn) into JSON representation
-2. Validate graph structure and weights manifests
-3. Emit WebNN JavaScript builder code
+2. Serialize JSON back to WebNN text format (full round-trip support)
+3. Validate graph structure and weights manifests
+4. Emit WebNN JavaScript builder code
 
 ## Build and Test Commands
 
@@ -63,29 +64,37 @@ make help
 
 ## CLI Usage
 
-The binary is named `webnn-graph` with six subcommands:
+The binary is named `webnn-graph` with seven subcommands. **All commands accept both .webnn and .json formats** (auto-detected).
 
 ### Graph Operations
 
-Parse graph text to JSON:
-```bash
-make parse
-# Or directly:
-webnn-graph parse examples/resnet_head.webnn > graph.json
-```
-
-Validate JSON (with optional weights manifest):
+Validate graph structure (accepts .webnn or .json):
 ```bash
 make validate
 # Or directly:
+webnn-graph validate examples/resnet_head.webnn
 webnn-graph validate graph.json --weights-manifest examples/weights.manifest.json
 ```
 
-Emit JavaScript builder code (includes WeightsFile helper):
+Emit JavaScript builder code (accepts .webnn or .json):
 ```bash
 make emit-js
 # Or directly:
-webnn-graph emit-js graph.json > buildGraph.js
+webnn-graph emit-js examples/resnet_head.webnn > buildGraph.js
+webnn-graph emit-js graph.json > buildGraph.js  # Also works
+```
+
+Parse graph text to JSON (explicit conversion):
+```bash
+webnn-graph parse examples/resnet_head.webnn > graph.json
+```
+
+Serialize JSON back to WebNN text format (explicit conversion):
+```bash
+webnn-graph serialize graph.json > model.webnn
+
+# Complete round-trip:
+webnn-graph parse model.webnn | webnn-graph serialize /dev/stdin > model_copy.webnn
 ```
 
 ### Weights Management
@@ -116,11 +125,11 @@ webnn-graph create-manifest \
 
 ## Complete Workflow Example
 
-The DSL is designed for **complete separation of concerns**: graph structure is reusable, weights are external, and input data is provided at runtime.
+The DSL uses **.webnn as the primary format** (10x smaller than JSON). The DSL is designed for **complete separation of concerns**: graph structure is reusable, weights are external, and input data is provided at runtime.
 
 ### 1. Define Graph (Data-Agnostic)
 
-Create `model.webnn`:
+Create `model.webnn` (primary format):
 ```webnn
 webnn_graph "resnet_head" v1 {
   inputs {
@@ -152,10 +161,9 @@ webnn-graph pack-weights \
 
 ### 3. Generate JavaScript
 
-Build the runtime code:
+Build the runtime code directly from .webnn:
 ```bash
-webnn-graph parse model.webnn | \
-  webnn-graph emit-js /dev/stdin > buildGraph.js
+webnn-graph emit-js model.webnn > buildGraph.js
 ```
 
 This generates both the `WeightsFile` helper class and the `buildGraph()` function.
@@ -196,6 +204,14 @@ const result2 = await context.compute(graph, { x: input2 });
   - Uses `wg.pest` grammar file
   - `parse_wg_text()`: Main entry point converting WebNN text to `GraphJson`
   - Handles four main blocks: inputs, consts, nodes, outputs
+  - Extracts and stores graph name from header
+
+- **serialize.rs**: WebNN text format serializer
+  - `serialize_graph_to_wg_text()`: Main entry point converting `GraphJson` to WebNN text
+  - Generates properly formatted .webnn files with 2-space indentation
+  - Handles all const initializations (weights, scalar, inline bytes)
+  - Supports multi-output nodes and options serialization
+  - `SerializeError`: Error type for serialization failures
 
 - **validate.rs**: Graph validation logic
   - `validate_graph()`: Checks format version, output presence, reference validity
@@ -241,9 +257,16 @@ webnn_graph "name" v1 {
 
 ### Data Flow
 
-1. Parse phase: WebNN text (.webnn) → `GraphJson` (.json)
-2. Validate phase: Check structure + optional weights manifest
-3. Emit phase: `GraphJson` → WebNN JavaScript code
+**Primary workflow** (.webnn is 10x smaller than JSON):
+1. Author: Write `.webnn` text files (human-readable, compact)
+2. Validate: `webnn-graph validate model.webnn` (parses internally)
+3. Emit: `webnn-graph emit-js model.webnn` (generates JavaScript)
+
+**Optional conversions**:
+- Parse: `.webnn` → `.json` (for programmatic manipulation)
+- Serialize: `.json` → `.webnn` (for human editing)
+
+The tool supports full round-tripping: text ↔ JSON, preserving semantics.
 
 ### Key Invariants
 
@@ -251,15 +274,17 @@ webnn_graph "name" v1 {
 - Graph outputs must reference valid node results
 - Weights manifest entries must match const declarations in type and shape
 - Node IDs must be unique
+- Graph name is optional in JSON but will default to "graph" when serializing
 
 ## Test Coverage
 
-The project has comprehensive test coverage across all modules (40 tests total):
+The project has comprehensive test coverage across all modules (50 tests total):
 
 - **ast.rs**: Tests for DataType conversion, OperandDesc equality, ConstInit variants
 - **weights.rs**: Tests for dtype_size, numel, and large value handling
 - **weights_io.rs**: Tests for pack/unpack roundtrip, validation, and error handling
 - **parser.rs**: Tests for parsing inputs, consts, nodes, outputs, and error handling
+- **serialize.rs**: Tests for serialization, round-trip preservation, string escaping, all data types
 - **validate.rs**: Tests for graph validation and weights validation
 - **emit_js.rs**: Tests for JavaScript code generation with various graph configurations
 

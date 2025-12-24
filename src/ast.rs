@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 pub struct GraphJson {
     pub format: String, // "webnn-graph-json"
     pub version: u32,   // 1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub inputs: BTreeMap<String, OperandDesc>,
     #[serde(default)]
     pub consts: BTreeMap<String, ConstDecl>,
@@ -54,6 +56,19 @@ impl DataType {
             _ => None,
         }
     }
+
+    pub fn to_wg_text(&self) -> &'static str {
+        match self {
+            Self::Float32 => "f32",
+            Self::Float16 => "f16",
+            Self::Int32 => "i32",
+            Self::Uint32 => "u32",
+            Self::Int64 => "i64",
+            Self::Uint64 => "u64",
+            Self::Int8 => "i8",
+            Self::Uint8 => "u8",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +102,7 @@ pub fn new_graph_json() -> GraphJson {
     GraphJson {
         format: "webnn-graph-json".to_string(),
         version: 1,
+        name: None,
         inputs: BTreeMap::new(),
         consts: BTreeMap::new(),
         nodes: Vec::new(),
