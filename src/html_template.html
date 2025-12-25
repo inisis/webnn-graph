@@ -500,37 +500,56 @@
       if (nodesMatch) {
         const nodeLines = nodesMatch[1].split(';').filter(l => l.trim());
         for (const line of nodeLines) {
-          // Match multi-output nodes: [a, b] = op(...)
-          let match = line.match(/\[([^\]]+)\]\s*=\s*(\w+)\(([^)]*)\)/);
-          if (match) {
-            const [, outputs, op, inputs] = match;
-            const outputIds = outputs.split(',').map(s => s.trim());
-            const inputIds = inputs.split(',').map(s => s.trim()).filter(s => s);
-            graph.nodes.push({
-              id: outputIds[0],
-              op: op,
-              inputs: inputIds,
-              options: {},
-              outputs: outputIds
-            });
-            continue;
-          }
-
-          // Match single-output nodes with options: result = op(input1, input2, key=value)
-          match = line.match(/(\w+)\s*=\s*(\w+)\(([^)]*)\)/);
+          // Match nodes with square brackets: [output] = op(...) or output = op(...)
+          let match = line.match(/\[?(\w+)\]?\s*=\s*(\w+)\(([^)]*)\)/);
           if (match) {
             const [, id, op, args] = match;
-            const parts = args.split(',').map(s => s.trim()).filter(s => s);
+
+            // Parse arguments - they can be inputs or key=value options
+            const parts = [];
+            let current = '';
+            let depth = 0;
+
+            // Split by comma but respect nested brackets
+            for (let i = 0; i < args.length; i++) {
+              const char = args[i];
+              if (char === '[') depth++;
+              else if (char === ']') depth--;
+              else if (char === ',' && depth === 0) {
+                parts.push(current.trim());
+                current = '';
+                continue;
+              }
+              current += char;
+            }
+            if (current.trim()) parts.push(current.trim());
+
             const inputs = [];
             const options = {};
 
             for (const part of parts) {
               if (part.includes('=')) {
-                const [key, value] = part.split('=').map(s => s.trim());
-                // Try to parse as number
-                const numValue = parseFloat(value);
-                options[key] = isNaN(numValue) ? value : numValue;
-              } else {
+                const eqIndex = part.indexOf('=');
+                const key = part.substring(0, eqIndex).trim();
+                let value = part.substring(eqIndex + 1).trim();
+
+                // Handle different value types
+                if (value.startsWith('[') && value.endsWith(']')) {
+                  // Array value like [1, 1, 1, 1]
+                  const arrayStr = value.slice(1, -1);
+                  options[key] = arrayStr.split(',').map(v => {
+                    const num = parseFloat(v.trim());
+                    return isNaN(num) ? v.trim() : num;
+                  });
+                } else if (value.startsWith('"') && value.endsWith('"')) {
+                  // String value like "oihw"
+                  options[key] = value.slice(1, -1);
+                } else {
+                  // Numeric or boolean value
+                  const numValue = parseFloat(value);
+                  options[key] = isNaN(numValue) ? value : numValue;
+                }
+              } else if (part && !part.includes('=')) {
                 inputs.push(part);
               }
             }
