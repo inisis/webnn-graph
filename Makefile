@@ -1,4 +1,4 @@
-.PHONY: all build test fmt clean run check lint help parse validate emit-js coverage
+.PHONY: all build test fmt clean run check lint help parse validate emit-js emit-html coverage
 
 # Default target
 all: build
@@ -57,6 +57,12 @@ emit-js:
 	cargo run --bin webnn-graph -- parse examples/resnet_head.webnn > /tmp/graph.json && \
 	cargo run --bin webnn-graph -- emit-js /tmp/graph.json
 
+# Generate HTML visualizer for example graph
+emit-html:
+	cargo run --bin webnn-graph -- emit-html examples/resnet_head.webnn > /tmp/webnn_viz.html
+	@echo "Visualizer generated: /tmp/webnn_viz.html"
+	@echo "Open it with: open /tmp/webnn_viz.html"
+
 # Run tests with coverage (requires cargo-tarpaulin)
 coverage:
 	@if command -v cargo-tarpaulin >/dev/null 2>&1; then \
@@ -90,6 +96,7 @@ help:
 	@echo "  make parse         - Parse example graph"
 	@echo "  make validate      - Validate example graph"
 	@echo "  make emit-js       - Emit JavaScript for example"
+	@echo "  make emit-html     - Generate HTML visualizer for example"
 	@echo "  make coverage      - Generate test coverage report"
 	@echo "  make dev-deps      - Install development dependencies"
 	@echo "  make help          - Show this help message"

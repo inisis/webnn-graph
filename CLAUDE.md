@@ -64,7 +64,7 @@ make help
 
 ## CLI Usage
 
-The binary is named `webnn-graph` with seven subcommands. **All commands accept both .webnn and .json formats** (auto-detected).
+The binary is named `webnn-graph` with nine subcommands. **All commands accept both .webnn and .json formats** (auto-detected).
 
 ### Graph Operations
 
@@ -82,6 +82,21 @@ make emit-js
 # Or directly:
 webnn-graph emit-js examples/resnet_head.webnn > buildGraph.js
 webnn-graph emit-js graph.json > buildGraph.js  # Also works
+```
+
+Generate interactive HTML visualizer (accepts .webnn or .json):
+```bash
+make emit-html
+# Or directly:
+webnn-graph emit-html examples/resnet_head.webnn > visualizer.html
+open visualizer.html
+
+# Features:
+# - Interactive graph layout with zoom/pan
+# - Node details sidebar on click
+# - Export to PNG/SVG
+# - Light/dark theme toggle
+# - Works completely offline (no network requests)
 ```
 
 Parse graph text to JSON (explicit conversion):

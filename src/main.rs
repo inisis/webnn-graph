@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::fs;
 
 use webnn_graph::ast::GraphJson;
+use webnn_graph::emit_html::emit_html;
 use webnn_graph::emit_js::{emit_builder_js, emit_weights_loader_js};
 use webnn_graph::parser::parse_wg_text;
 use webnn_graph::serialize::serialize_graph_to_wg_text;
@@ -30,6 +31,9 @@ enum Command {
         weights_manifest: Option<String>,
     },
     EmitJs {
+        path: String,
+    },
+    EmitHtml {
         path: String,
     },
     Serialize {
@@ -134,6 +138,12 @@ fn main() -> anyhow::Result<()> {
             // Emit buildGraph function
             let js = emit_builder_js(&g);
             print!("{js}");
+        }
+        Command::EmitHtml { path } => {
+            let g = load_graph(&path)?;
+            validate_graph(&g)?;
+            let html = emit_html(&g);
+            print!("{html}");
         }
         Command::Serialize { path } => {
             let txt = fs::read_to_string(path)?;

@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod emit_html;
 pub mod emit_js;
 pub mod parser;
 pub mod serialize;
