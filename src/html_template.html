@@ -918,9 +918,9 @@
         this.viewBox.width *= factor;
         this.viewBox.height *= factor;
 
-        // Clamp zoom level
-        const minZoom = 0.1;
-        const maxZoom = 10;
+        // Clamp zoom level (wider range for large models)
+        const minZoom = 0.01;  // Zoom out to 1% for large models like MobileNet
+        const maxZoom = 20;     // Zoom in to 2000% for detail inspection
         if (this.viewBox.width < this.renderer.initialViewBox.width * minZoom) {
           this.viewBox.width = this.renderer.initialViewBox.width * minZoom;
           this.viewBox.height = this.renderer.initialViewBox.height * minZoom;
