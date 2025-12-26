@@ -5,10 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 webnn-graph is a Rust implementation for a WebNN-oriented graph DSL. It provides a complete pipeline:
-1. Parse WebNN graph text files (.webnn) into JSON representation
-2. Serialize JSON back to WebNN text format (full round-trip support)
-3. Validate graph structure and weights manifests
-4. Emit WebNN JavaScript builder code
+1. **Convert ONNX models** to WebNN format (NEW!)
+2. Parse WebNN graph text files (.webnn) into JSON representation
+3. Serialize JSON back to WebNN text format (full round-trip support)
+4. Validate graph structure and weights manifests
+5. Emit WebNN JavaScript builder code
 
 ## Build and Test Commands
 
@@ -64,7 +65,7 @@ make help
 
 ## CLI Usage
 
-The binary is named `webnn-graph` with nine subcommands. **All commands accept both .webnn and .json formats** (auto-detected).
+The binary is named `webnn-graph` with ten subcommands. **Most commands accept both .webnn and .json formats** (auto-detected).
 
 ### Graph Operations
 
@@ -110,6 +111,42 @@ webnn-graph serialize graph.json > model.webnn
 
 # Complete round-trip:
 webnn-graph parse model.webnn | webnn-graph serialize /dev/stdin > model_copy.webnn
+```
+
+### ONNX Conversion
+
+Convert ONNX models to WebNN format:
+```bash
+# Basic conversion (extracts weights by default)
+webnn-graph convert-onnx --input model.onnx
+
+# Output: model.webnn + model.weights + model.manifest.json
+
+# Custom output paths
+webnn-graph convert-onnx \
+  --input model.onnx \
+  --output graph.webnn \
+  --weights graph.weights \
+  --manifest graph.manifest.json
+
+# Inline weights for small models
+webnn-graph convert-onnx --input model.onnx --inline-weights
+
+# Output to JSON format
+webnn-graph convert-onnx --input model.onnx --output model.json
+```
+
+**Supported operators** (NLP/Transformer focused):
+- **MatMul, Gemm**: Matrix multiplication with options
+- **Add, Sub, Mul, Div, Pow**: Element-wise operations
+- **LayerNormalization, Softmax**: Normalization operations
+- **Reshape, Transpose, Concat, Split**: Tensor manipulation
+
+**Full pipeline example**:
+```bash
+# Convert ONNX → WebNN → JavaScript
+webnn-graph convert-onnx --input model.onnx
+webnn-graph emit-js model.webnn > buildGraph.js
 ```
 
 ### Weights Management

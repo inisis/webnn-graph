@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
 use std::fs;
+use std::path::Path;
 
 use webnn_graph::ast::GraphJson;
 use webnn_graph::emit_html::emit_html;
 use webnn_graph::emit_js::{emit_builder_js, emit_weights_loader_js};
+use webnn_graph::onnx::convert::{convert_onnx, ConvertOptions};
 use webnn_graph::parser::parse_wg_text;
 use webnn_graph::serialize::serialize_graph_to_wg_text;
 use webnn_graph::validate::{validate_graph, validate_weights};
@@ -84,6 +86,27 @@ enum Command {
         manifest: String,
         #[arg(long)]
         output: String,
+    },
+    ConvertOnnx {
+        /// Input ONNX model file (.onnx)
+        #[arg(long)]
+        input: String,
+
+        /// Output graph file (.webnn or .json)
+        #[arg(long)]
+        output: Option<String>,
+
+        /// Inline weights instead of extracting to external file
+        #[arg(long)]
+        inline_weights: bool,
+
+        /// Weights output file (.weights)
+        #[arg(long)]
+        weights: Option<String>,
+
+        /// Weights manifest file (.manifest.json)
+        #[arg(long)]
+        manifest: Option<String>,
     },
 }
 
@@ -196,6 +219,61 @@ fn main() -> anyhow::Result<()> {
             let json = serde_json::to_string_pretty(&new_graph)?;
             fs::write(&output, json)?;
             eprintln!("Wrote graph with inline weights to: {}", output);
+        }
+        Command::ConvertOnnx {
+            input,
+            output,
+            inline_weights,
+            weights,
+            manifest,
+        } => {
+            // Determine output paths
+            let input_path = Path::new(&input);
+            let base_name = input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+
+            let output_path = output.unwrap_or_else(|| format!("{}.webnn", base_name));
+            let weights_path = if inline_weights {
+                None
+            } else {
+                Some(weights.unwrap_or_else(|| format!("{}.weights", base_name)))
+            };
+            let manifest_path = if inline_weights {
+                None
+            } else {
+                Some(manifest.unwrap_or_else(|| format!("{}.manifest.json", base_name)))
+            };
+
+            // Convert ONNX to GraphJson
+            let options = ConvertOptions {
+                extract_weights: !inline_weights,
+                output_path: output_path.clone(),
+                weights_path: weights_path.clone(),
+                manifest_path: manifest_path.clone(),
+            };
+
+            let graph = convert_onnx(&input, options)?;
+
+            // Serialize to .webnn text format (default) or JSON
+            let output_content = if output_path.ends_with(".json") {
+                serde_json::to_string_pretty(&graph)?
+            } else {
+                serialize_graph_to_wg_text(&graph)?
+            };
+
+            fs::write(&output_path, output_content)?;
+            eprintln!("✓ Converted ONNX model to: {}", output_path);
+
+            if !inline_weights {
+                if let Some(w_path) = &weights_path {
+                    eprintln!("✓ Extracted weights to: {}", w_path);
+                }
+                if let Some(m_path) = &manifest_path {
+                    eprintln!("✓ Generated manifest: {}", m_path);
+                }
+            }
         }
     }
 
