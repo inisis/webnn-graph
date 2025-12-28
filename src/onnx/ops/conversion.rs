@@ -2,7 +2,7 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, OpHandler};
+use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use onnx::onnx::NodeProto;
 use serde_json::Map;
 
@@ -16,8 +16,8 @@ impl OpHandler for ConversionHandler {
     fn convert(
         &self,
         node: &NodeProto,
-        _context: &ConversionContext,
-    ) -> Result<Vec<Node>, OnnxError> {
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.get_op_type();
         let node_name = if node.has_name() {
             node.get_name().to_string()
@@ -26,7 +26,7 @@ impl OpHandler for ConversionHandler {
         };
 
         match op_type {
-            "Cast" => self.convert_cast(node, &node_name),
+            "Cast" => self.convert_cast(node, &node_name, context),
             "Constant" => self.convert_constant(node, &node_name),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
@@ -39,7 +39,12 @@ impl OpHandler for ConversionHandler {
 impl ConversionHandler {
     /// Convert ONNX Cast to WebNN cast
     /// ONNX Cast converts tensor data type
-    fn convert_cast(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_cast(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.len() != 1 {
             return Err(OnnxError::InvalidShape(format!(
@@ -69,7 +74,7 @@ impl ConversionHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
 
         // Map ONNX type to WebNN DataType
         let target_type = crate::onnx::types::map_onnx_data_type(to_type.unwrap() as i32)?;
@@ -80,18 +85,30 @@ impl ConversionHandler {
             serde_json::json!(format!("{:?}", target_type)),
         );
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "cast".to_string(),
             inputs: vec![input0],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Constant to WebNN constant
     /// ONNX Constant creates an inline constant tensor
-    fn convert_constant(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_constant(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+    ) -> Result<ConversionResult, OnnxError> {
         let output_name = if node.get_output().is_empty() {
             format!("{}_output", node_name)
         } else {
@@ -132,13 +149,21 @@ impl ConversionHandler {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw_data);
         options.insert("data".to_string(), serde_json::json!(b64_data));
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "constant".to_string(),
             inputs: vec![],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 }
 
@@ -179,15 +204,23 @@ mod tests {
         let handler = ConversionHandler;
         let mut node = create_test_node("Cast", vec!["x"], vec!["y"]);
         add_int_attribute(&mut node, "to", 7); // INT64
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "cast");
-        assert_eq!(result[0].inputs, vec!["x"]);
-        assert!(result[0].options.contains_key("to"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "cast");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert!(result.nodes[0].options.contains_key("to"));
     }
 }

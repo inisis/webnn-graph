@@ -109,6 +109,19 @@ fn parse_consts_block(
                             .map(|p| parse_number_value(p.as_str()))
                             .unwrap_or(Value::Null);
                         init = Some(ConstInit::Scalar { value: n });
+                    } else if text.starts_with("@bytes") {
+                        let bytes = ann
+                            .into_inner()
+                            .find(|p| p.as_rule() == Rule::byte_array)
+                            .map(|pair| {
+                                pair.into_inner()
+                                    .filter(|p| p.as_rule() == Rule::int)
+                                    .filter_map(|p| p.as_str().parse::<u32>().ok())
+                                    .map(|v| v as u8)
+                                    .collect::<Vec<u8>>()
+                            })
+                            .unwrap_or_default();
+                        init = Some(ConstInit::InlineBytes { bytes });
                     }
                 }
             }

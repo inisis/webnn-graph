@@ -1,6 +1,6 @@
 // Operator handler trait and registry
 
-use crate::ast::Node;
+use crate::ast::{ConstDecl, Node};
 use crate::onnx::convert::OnnxError;
 use onnx::onnx::{NodeProto, TensorProto};
 use std::collections::HashMap;
@@ -26,9 +26,51 @@ use utility::UtilityHandler;
 /// Context for operator conversion
 pub struct ConversionContext<'a> {
     /// Map of initializer names to TensorProto (for resolving constant shapes)
-    pub initializers: HashMap<String, &'a TensorProto>,
+    pub initializers: &'a HashMap<String, &'a TensorProto>,
     /// Map of value names to their shapes (for shape inference)
-    pub value_shapes: HashMap<String, Vec<i64>>,
+    pub value_shapes: &'a HashMap<String, Vec<i64>>,
+    /// Map of value names to constant integer contents (for const folding)
+    pub const_values: &'a HashMap<String, Vec<i64>>,
+    /// Map of ONNX value names to WebNN value identifiers
+    pub value_ids: &'a HashMap<String, String>,
+    /// Map of value names to data types
+    pub value_types: &'a HashMap<String, crate::ast::DataType>,
+}
+
+impl<'a> ConversionContext<'a> {
+    pub fn resolve_input(&self, name: &str) -> String {
+        if let Some(mapped) = self.value_ids.get(name) {
+            return mapped.clone();
+        }
+
+        let sanitized = crate::onnx::convert::sanitize_identifier(name);
+        if let Some(mapped) = self.value_ids.get(&sanitized) {
+            return mapped.clone();
+        }
+
+        sanitized
+    }
+}
+
+/// Results of converting a single ONNX node
+pub struct ConversionResult {
+    pub nodes: Vec<Node>,
+    pub consts: Vec<(String, ConstDecl)>,
+    /// ONNX output name -> WebNN value id
+    pub output_mappings: HashMap<String, String>,
+    /// ONNX output name -> data type
+    pub output_types: HashMap<String, crate::ast::DataType>,
+}
+
+impl ConversionResult {
+    pub fn new(nodes: Vec<Node>) -> Self {
+        Self {
+            nodes,
+            consts: Vec::new(),
+            output_mappings: HashMap::new(),
+            output_types: HashMap::new(),
+        }
+    }
 }
 
 /// Trait for handling ONNX operator conversion
@@ -41,7 +83,7 @@ pub trait OpHandler {
         &self,
         node: &NodeProto,
         context: &ConversionContext<'a>,
-    ) -> Result<Vec<Node>, OnnxError>;
+    ) -> Result<ConversionResult, OnnxError>;
 }
 
 /// Registry for operator handlers
@@ -71,7 +113,7 @@ impl OpRegistry {
         &self,
         node: &NodeProto,
         context: &ConversionContext<'a>,
-    ) -> Result<Vec<Node>, OnnxError> {
+    ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.get_op_type();
 
         for handler in &self.handlers {

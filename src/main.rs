@@ -107,6 +107,19 @@ enum Command {
         /// Weights manifest file (.manifest.json)
         #[arg(long)]
         manifest: Option<String>,
+
+        /// Override dynamic dimension values (e.g., batch_size=1)
+        /// Can be specified multiple times for different dimensions
+        #[arg(long = "override-dim", value_name = "NAME=VALUE")]
+        override_dims: Vec<String>,
+
+        /// Read dynamic dimension overrides from a JSON file (supports { "freeDimensionOverrides": { ... } } or a flat object)
+        #[arg(long = "override-dims-file")]
+        override_dims_file: Option<String>,
+
+        /// Enable constant folding and shape propagation optimizations
+        #[arg(long)]
+        optimize: bool,
     },
 }
 
@@ -226,7 +239,55 @@ fn main() -> anyhow::Result<()> {
             inline_weights,
             weights,
             manifest,
+            override_dims,
+            override_dims_file,
+            optimize,
         } => {
+            // Parse dimension overrides
+            let mut free_dim_overrides = if let Some(path) = override_dims_file {
+                let content = fs::read_to_string(&path)?;
+                let json: serde_json::Value = serde_json::from_str(&content)?;
+                let overrides = json
+                    .get("freeDimensionOverrides")
+                    .unwrap_or(&json)
+                    .as_object()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "override-dims-file must be a JSON object (optionally nested under freeDimensionOverrides)"
+                        )
+                    })?;
+
+                let mut map = std::collections::HashMap::new();
+                for (name, value) in overrides {
+                    let parsed = value.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "override value for '{}' must be an integer, got {}",
+                            name,
+                            value
+                        )
+                    })?;
+                    map.insert(name.to_string(), parsed as u32);
+                }
+                map
+            } else {
+                std::collections::HashMap::new()
+            };
+            for override_dim in override_dims {
+                let parts: Vec<&str> = override_dim.split('=').collect();
+                if parts.len() != 2 {
+                    return Err(anyhow::anyhow!(
+                        "Invalid override-dim format: '{}'. Expected NAME=VALUE",
+                        override_dim
+                    ));
+                }
+                let name = parts[0].trim().to_string();
+                let value: u32 = parts[1]
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid dimension value: '{}'", parts[1]))?;
+                free_dim_overrides.insert(name, value);
+            }
+
             // Determine output paths
             let input_path = Path::new(&input);
             let base_name = input_path
@@ -251,6 +312,8 @@ fn main() -> anyhow::Result<()> {
                 extract_weights: !inline_weights,
                 output_path: output_path.clone(),
                 weights_path: weights_path.clone(),
+                free_dim_overrides,
+                optimize,
                 manifest_path: manifest_path.clone(),
             };
 

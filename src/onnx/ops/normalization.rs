@@ -2,7 +2,7 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, OpHandler};
+use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use onnx::onnx::NodeProto;
 use serde_json::Map;
 
@@ -16,8 +16,8 @@ impl OpHandler for NormalizationHandler {
     fn convert(
         &self,
         node: &NodeProto,
-        _context: &ConversionContext,
-    ) -> Result<Vec<Node>, OnnxError> {
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.get_op_type();
         let node_name = if node.has_name() {
             node.get_name().to_string()
@@ -26,8 +26,8 @@ impl OpHandler for NormalizationHandler {
         };
 
         match op_type {
-            "LayerNormalization" => self.convert_layer_norm(node, &node_name),
-            "Softmax" => self.convert_softmax(node, &node_name),
+            "LayerNormalization" => self.convert_layer_norm(node, &node_name, context),
+            "Softmax" => self.convert_softmax(node, &node_name, context),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
                 node: node_name,
@@ -42,7 +42,8 @@ impl NormalizationHandler {
         &self,
         node: &NodeProto,
         node_name: &str,
-    ) -> Result<Vec<Node>, OnnxError> {
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.is_empty() {
             return Err(OnnxError::InvalidShape(
@@ -88,32 +89,45 @@ impl NormalizationHandler {
         // LayerNormalization can have scale and bias as inputs
         let webnn_inputs = if inputs.len() >= 3 {
             // Input, scale, bias
-            let input0 = sanitize_identifier(&inputs[0].to_string());
-            let input1 = sanitize_identifier(&inputs[1].to_string());
-            let input2 = sanitize_identifier(&inputs[2].to_string());
+            let input0 = context.resolve_input(&inputs[0]);
+            let input1 = context.resolve_input(&inputs[1]);
+            let input2 = context.resolve_input(&inputs[2]);
             vec![input0, input1, input2]
         } else if inputs.len() == 2 {
             // Input, scale
-            let input0 = sanitize_identifier(&inputs[0].to_string());
-            let input1 = sanitize_identifier(&inputs[1].to_string());
+            let input0 = context.resolve_input(&inputs[0]);
+            let input1 = context.resolve_input(&inputs[1]);
             vec![input0, input1]
         } else {
             // Just input
-            let input0 = sanitize_identifier(&inputs[0].to_string());
+            let input0 = context.resolve_input(&inputs[0]);
             vec![input0]
         };
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "layerNormalization".to_string(),
             inputs: webnn_inputs,
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Softmax to WebNN softmax
-    fn convert_softmax(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_softmax(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.len() != 1 {
             return Err(OnnxError::InvalidShape(format!(
@@ -136,19 +150,27 @@ impl NormalizationHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
 
         let mut options = Map::new();
         // WebNN softmax uses axis parameter (single value)
         options.insert("axis".to_string(), serde_json::json!(axis));
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "softmax".to_string(),
             inputs: vec![input0],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 }
 
@@ -190,32 +212,48 @@ mod tests {
         let handler = NormalizationHandler;
         let mut node = create_test_node("Softmax", vec!["x"], vec!["y"]);
         add_int_attribute(&mut node, "axis", -1);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "softmax");
-        assert_eq!(result[0].inputs, vec!["x"]);
-        assert_eq!(result[0].id, "y");
-        assert!(result[0].options.contains_key("axis"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "softmax");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert_eq!(result.nodes[0].id, "y");
+        assert!(result.nodes[0].options.contains_key("axis"));
     }
 
     #[test]
     fn test_convert_layer_norm() {
         let handler = NormalizationHandler;
         let node = create_test_node("LayerNormalization", vec!["x", "scale", "bias"], vec!["y"]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "layerNormalization");
-        assert_eq!(result[0].inputs.len(), 3);
-        assert!(result[0].options.contains_key("epsilon"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "layerNormalization");
+        assert_eq!(result.nodes[0].inputs.len(), 3);
+        assert!(result.nodes[0].options.contains_key("epsilon"));
     }
 }

@@ -35,8 +35,14 @@ ty = { dtype ~ shape }
 dtype = { "f32" | "f16" | "i32" | "u32" | "i64" | "u64" | "i8" | "u8" }
 shape = { "[" ~ (int ~ ("," ~ int)*)? ~ "]" }
 
-// @weights("key") or @scalar(1.0)
-const_annot = { "@weights" ~ "(" ~ string ~ ")" | "@scalar" ~ "(" ~ number ~ ")" }
+// @weights("key") or @scalar(1.0) or @bytes([1,2,3])
+const_annot = {
+    "@weights" ~ "(" ~ string ~ ")"
+    | "@scalar" ~ "(" ~ number ~ ")"
+    | "@bytes" ~ "(" ~ byte_array ~ ")"
+}
+
+byte_array = { "[" ~ (int ~ ("," ~ int)*)? ~ "]" }
 
 ident = @{ (ASCII_ALPHA | "_" | "/") ~ (ASCII_ALPHANUMERIC | "_" | "." | "/")* }
 int = @{ ASCII_DIGIT+ }

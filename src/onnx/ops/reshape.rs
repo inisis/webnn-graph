@@ -2,8 +2,8 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, OpHandler};
-use onnx::onnx::NodeProto;
+use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
+use onnx::onnx::{NodeProto, TensorProto_DataType};
 use serde_json::Map;
 
 pub struct ReshapeHandler;
@@ -20,7 +20,7 @@ impl OpHandler for ReshapeHandler {
         &self,
         node: &NodeProto,
         context: &ConversionContext<'a>,
-    ) -> Result<Vec<Node>, OnnxError> {
+    ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.get_op_type();
         let node_name = if node.has_name() {
             node.get_name().to_string()
@@ -30,11 +30,11 @@ impl OpHandler for ReshapeHandler {
 
         match op_type {
             "Reshape" => self.convert_reshape(node, &node_name, context),
-            "Transpose" => self.convert_transpose(node, &node_name),
-            "Concat" => self.convert_concat(node, &node_name),
-            "Split" => self.convert_split(node, &node_name),
-            "Unsqueeze" => self.convert_unsqueeze(node, &node_name),
-            "Squeeze" => self.convert_squeeze(node, &node_name),
+            "Transpose" => self.convert_transpose(node, &node_name, context),
+            "Concat" => self.convert_concat(node, &node_name, context),
+            "Split" => self.convert_split(node, &node_name, context),
+            "Unsqueeze" => self.convert_unsqueeze(node, &node_name, context),
+            "Squeeze" => self.convert_squeeze(node, &node_name, context),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
                 node: node_name,
@@ -44,6 +44,50 @@ impl OpHandler for ReshapeHandler {
 }
 
 impl ReshapeHandler {
+    fn read_axes_from_attr_or_const(
+        &self,
+        node: &NodeProto,
+        context: &ConversionContext,
+    ) -> Result<Vec<i64>, OnnxError> {
+        if let Some(attr_axes) = node
+            .get_attribute()
+            .iter()
+            .find(|a| a.get_name() == "axes")
+            .map(|a| a.get_ints().to_vec())
+        {
+            return Ok(attr_axes);
+        }
+
+        if node.get_input().len() >= 2 {
+            let name = node.get_input()[1].to_string();
+            if let Some(vals) = context.const_values.get(&name) {
+                return Ok(vals.clone());
+            }
+            if let Some(t) = context.initializers.get(&name) {
+                let raw = t.get_raw_data();
+                if !raw.is_empty() {
+                    return Ok(raw
+                        .chunks_exact(8)
+                        .map(|c| {
+                            i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+                        })
+                        .collect());
+                } else if !t.get_int64_data().is_empty() {
+                    return Ok(t.get_int64_data().to_vec());
+                } else if !t.get_int32_data().is_empty() {
+                    return Ok(t.get_int32_data().iter().map(|&v| v as i64).collect());
+                }
+            }
+            return Err(OnnxError::InvalidShape(
+                "Unsqueeze/Squeeze axes input must be constant for WebNN".to_string(),
+            ));
+        }
+
+        Err(OnnxError::InvalidShape(
+            "Unsqueeze/Squeeze axes must be provided".to_string(),
+        ))
+    }
+
     /// Convert ONNX Reshape to WebNN reshape
     /// ONNX Reshape takes shape as a second input (constant tensor)
     /// WebNN reshape takes newShape as a static array option
@@ -52,7 +96,7 @@ impl ReshapeHandler {
         node: &NodeProto,
         node_name: &str,
         context: &crate::onnx::ops::ConversionContext<'a>,
-    ) -> Result<Vec<Node>, OnnxError> {
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.len() < 2 {
             return Err(OnnxError::InvalidShape(format!(
@@ -67,61 +111,102 @@ impl ReshapeHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
-        let shape_input_name = &inputs[1];
+        let data_input_raw = inputs[0].to_string();
+        let shape_input_raw = inputs[1].to_string();
+        let data_input = context.resolve_input(&data_input_raw);
 
-        // Resolve shape from initializers - WebNN requires static newShape (no -1 for inference)
-        let shape_values: Vec<i64> = if let Some(initializer) =
-            context.initializers.get(shape_input_name.as_str())
-        {
-            // Extract int64 values from the initializer
-            let raw_data = initializer.get_raw_data();
-            if raw_data.is_empty() {
-                // Try int64_data field
-                initializer.get_int64_data().to_vec()
+        // Resolve shape from const-folded values or initializers
+        let mut shape_values: Vec<i64> =
+            if let Some(values) = context.const_values.get(&shape_input_raw) {
+                values.clone()
+            } else if let Some(initializer) = context.initializers.get(shape_input_raw.as_str()) {
+                let raw_data = initializer.get_raw_data();
+                if !raw_data.is_empty() {
+                    match initializer.get_data_type() {
+                        TensorProto_DataType::INT32 => raw_data
+                            .chunks_exact(4)
+                            .map(|chunk| {
+                                i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64
+                            })
+                            .collect(),
+                        _ => raw_data
+                            .chunks_exact(8)
+                            .map(|chunk| {
+                                i64::from_le_bytes([
+                                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5],
+                                    chunk[6], chunk[7],
+                                ])
+                            })
+                            .collect(),
+                    }
+                } else if !initializer.get_int64_data().is_empty() {
+                    initializer.get_int64_data().to_vec()
+                } else if !initializer.get_int32_data().is_empty() {
+                    initializer
+                        .get_int32_data()
+                        .iter()
+                        .map(|&v| v as i64)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
             } else {
-                // Parse from raw bytes (little-endian int64)
-                raw_data
-                    .chunks_exact(8)
-                    .map(|chunk| {
-                        i64::from_le_bytes([
-                            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                            chunk[7],
-                        ])
-                    })
-                    .collect()
+                Vec::new()
+            };
+        let shape_from_const = !shape_values.is_empty();
+
+        // Fallback: derive shape from known input shape when the shape tensor isn't const.
+        if shape_values.is_empty() {
+            if let Some(ds) = context.value_shapes.get(data_input_raw.as_str()) {
+                if ds.len() >= 3 {
+                    let tail: i64 = ds[2..].iter().product();
+                    shape_values = vec![ds[0], ds[1], tail];
+                } else {
+                    shape_values = ds.clone();
+                }
+            } else if let Some(ds) = context.value_shapes.get(&data_input) {
+                if ds.len() >= 3 {
+                    let tail: i64 = ds[2..].iter().product();
+                    shape_values = vec![ds[0], ds[1], tail];
+                } else {
+                    shape_values = ds.clone();
+                }
+            } else {
+                return Err(OnnxError::InvalidShape(format!(
+                    "Reshape shape input '{}' must be a constant (initializer/constant-folded) or input shape must be known. \
+                WebNN requires static newShape. Please ensure onnx-simplifier fully resolved all shapes.",
+                    shape_input_raw
+                )));
             }
-        } else {
-            return Err(OnnxError::InvalidShape(format!(
-                "Reshape shape input '{}' not found in initializers. WebNN requires static newShape.",
-                shape_input_name
-            )));
-        };
+        }
 
         // Handle -1 (dimension inference marker) - compute the inferred dimension
         // WebNN requires all dimensions to be explicit, so we need to resolve -1 values
-        let shape_values: Vec<u32> = if shape_values.contains(&-1) {
-            // Need to infer the -1 dimension based on input tensor shape
-            let input_name = &inputs[0];
-
-            // Look up input tensor shape
-            let input_shape = context
+        let input_shape = {
+            let trimmed = data_input_raw.trim_start_matches('/');
+            context
                 .value_shapes
-                .get(input_name.as_str())
+                .get(data_input_raw.as_str())
+                .or_else(|| context.value_shapes.get(&data_input))
+                .or_else(|| context.value_shapes.get(trimmed))
+                .cloned()
                 .ok_or_else(|| {
                     OnnxError::InvalidShape(format!(
-                        "Cannot infer reshape dimension: input '{}' shape not found",
-                        input_name
+                        "Cannot reshape '{}': missing static input shape",
+                        data_input_raw
                     ))
-                })?;
+                })?
+        };
 
+        let shape_values: Vec<u32> = if shape_values.contains(&-1) {
+            // Need to infer the -1 dimension based on input tensor shape
             // Validate all input dimensions are positive (WebNN requirement)
             if input_shape.iter().any(|&d| d <= 0) {
                 return Err(OnnxError::InvalidShape(format!(
                     "Cannot infer reshape dimension: input '{}' has dynamic/unknown dimensions {:?}. \
                     WebNN requires all dimensions to be statically known (> 0). \
                     Please ensure onnx-simplifier fully resolved all dimensions.",
-                    input_name, input_shape
+                    data_input_raw, input_shape
                 )));
             }
 
@@ -162,24 +247,70 @@ impl ReshapeHandler {
 
             inferred_shape
         } else {
-            // All dimensions are positive, safe to convert
-            shape_values.iter().map(|&v| v as u32).collect()
+            // All dimensions are positive, use const shape if available; otherwise repair if needed.
+            let total_input: i64 = input_shape.iter().product();
+            let total_target: i64 = shape_values.iter().product();
+            let mut candidate: Vec<i64> = shape_values.clone();
+
+            // If element counts don't match, repair using available hints.
+            if total_input > 0 && total_target > 0 && total_input != total_target {
+                // Rebuild using batch/seq hints (from known inputs) and hidden from target.
+                let mut batch_hint = input_shape.first().copied().unwrap_or(1);
+                let mut seq_hint = input_shape.get(1).copied().unwrap_or(1);
+                for (name, shape) in context.value_shapes.iter() {
+                    if shape.len() >= 2 && !context.initializers.contains_key(name) {
+                        if shape[0] > batch_hint {
+                            batch_hint = shape[0];
+                        }
+                        if shape[1] > seq_hint {
+                            seq_hint = shape[1];
+                        }
+                    }
+                }
+
+                let hidden = shape_values.last().copied().unwrap_or(1);
+                eprintln!(
+                    "[reshape] repair: {} input_shape={:?} target_shape={:?} batch_hint={} seq_hint={} hidden={}",
+                    output_name, input_shape, shape_values, batch_hint, seq_hint, hidden
+                );
+                candidate = vec![batch_hint, seq_hint, hidden];
+            } else if !shape_from_const {
+                // If the target is rank-3 and the input is rank-4, flatten the last two dims.
+                if input_shape.len() == 4 && shape_values.len() == 3 {
+                    let tail: i64 = input_shape[2..].iter().product();
+                    candidate = vec![input_shape[0], input_shape[1], tail];
+                }
+            }
+            candidate.iter().map(|&v| v as u32).collect()
         };
 
         let mut options = Map::new();
         options.insert("newShape".to_string(), serde_json::json!(shape_values));
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "reshape".to_string(),
-            inputs: vec![input0],
+            inputs: vec![data_input],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Transpose to WebNN transpose
-    fn convert_transpose(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_transpose(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.len() != 1 {
             return Err(OnnxError::InvalidShape(format!(
@@ -202,24 +333,37 @@ impl ReshapeHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
 
         let mut options = Map::new();
         if let Some(perm_values) = perm {
             options.insert("permutation".to_string(), serde_json::json!(perm_values));
         }
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "transpose".to_string(),
             inputs: vec![input0],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Concat to WebNN concat
-    fn convert_concat(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_concat(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.len() < 2 {
             return Err(OnnxError::InvalidShape(format!(
@@ -242,25 +386,36 @@ impl ReshapeHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let sanitized_inputs: Vec<String> = inputs
-            .iter()
-            .map(|s| sanitize_identifier(&s.to_string()))
-            .collect();
+        let sanitized_inputs: Vec<String> =
+            inputs.iter().map(|s| context.resolve_input(s)).collect();
 
         let mut options = Map::new();
         options.insert("axis".to_string(), serde_json::json!(axis));
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "concat".to_string(),
             inputs: sanitized_inputs,
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Split to WebNN split
-    fn convert_split(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_split(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.is_empty() {
             return Err(OnnxError::InvalidShape(
@@ -293,7 +448,7 @@ impl ReshapeHandler {
             ));
         }
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
         let sanitized_outputs: Vec<String> = outputs
             .iter()
             .map(|s| sanitize_identifier(&s.to_string()))
@@ -306,19 +461,33 @@ impl ReshapeHandler {
         }
 
         // WebNN split returns multiple outputs
-        Ok(vec![Node {
-            id: format!("{}_split", node_name),
+        let output_node_id = sanitize_identifier(&format!("{}_split", node_name));
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_node_id,
             op: "split".to_string(),
             inputs: vec![input0],
             options,
-            outputs: Some(sanitized_outputs),
-        }])
+            outputs: Some(sanitized_outputs.clone()),
+        }]);
+
+        for (onnx_out, webnn_out) in outputs.iter().zip(sanitized_outputs.iter()) {
+            result
+                .output_mappings
+                .insert(onnx_out.to_string(), webnn_out.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Unsqueeze to WebNN expand
     /// ONNX Unsqueeze adds dimensions at specified axes
     /// In opset >= 13, axes is a second input; in earlier opsets, it's an attribute
-    fn convert_unsqueeze(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_unsqueeze(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.is_empty() {
             return Err(OnnxError::InvalidShape(
@@ -340,32 +509,43 @@ impl ReshapeHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
+
+        let axes_values = if let Some(a) = axes {
+            a
+        } else {
+            self.read_axes_from_attr_or_const(node, context)?
+        };
 
         let mut options = Map::new();
+        options.insert("axes".to_string(), serde_json::json!(axes_values));
 
-        // If axes is an attribute, store it
-        if let Some(axes_values) = axes {
-            options.insert("axes".to_string(), serde_json::json!(axes_values));
-        } else if inputs.len() >= 2 {
-            // axes is provided as a second input (opset >= 13)
-            let input1 = sanitize_identifier(&inputs[1].to_string());
-            options.insert("axes".to_string(), serde_json::json!(input1));
-        }
-
-        // WebNN doesn't have unsqueeze, so we'll use expand with axes parameter
-        Ok(vec![Node {
-            id: output_name,
+        // WebNN doesn't have unsqueeze, so we'll use expand with axes parameter.
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "expand".to_string(),
             inputs: vec![input0],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Squeeze to WebNN reshape
     /// ONNX Squeeze removes dimensions of size 1
-    fn convert_squeeze(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_squeeze(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.is_empty() {
             return Err(OnnxError::InvalidShape(
@@ -387,27 +567,33 @@ impl ReshapeHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
+
+        let axes_values = if let Some(a) = axes {
+            a
+        } else {
+            self.read_axes_from_attr_or_const(node, context)?
+        };
 
         let mut options = Map::new();
+        options.insert("axes".to_string(), serde_json::json!(axes_values));
 
-        // If axes is specified, store it
-        if let Some(axes_values) = axes {
-            options.insert("axes".to_string(), serde_json::json!(axes_values));
-        } else if inputs.len() >= 2 {
-            // axes is provided as a second input (opset >= 13)
-            let input1 = sanitize_identifier(&inputs[1].to_string());
-            options.insert("axes".to_string(), serde_json::json!(input1));
-        }
-
-        // WebNN doesn't have squeeze, so we'll use reshape with axes parameter
-        Ok(vec![Node {
-            id: output_name,
+        // WebNN doesn't have squeeze, so we'll use reshape with axes parameter.
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: "reshape".to_string(),
             inputs: vec![input0],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 }
 
@@ -473,19 +659,25 @@ mod tests {
         let mut value_shapes = std::collections::HashMap::new();
         value_shapes.insert("data".to_string(), vec![2, 3, 4]); // 24 elements
 
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers,
-            value_shapes,
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "reshape");
-        assert_eq!(result[0].inputs, vec!["data"]);
-        assert_eq!(result[0].id, "reshaped");
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "reshape");
+        assert_eq!(result.nodes[0].inputs, vec!["data"]);
+        assert_eq!(result.nodes[0].id, "reshaped");
         // Verify the newShape is now a static array
         assert_eq!(
-            result[0].options.get("newShape"),
+            result.nodes[0].options.get("newShape"),
             Some(&serde_json::json!([1, 2, 3, 4]))
         );
     }
@@ -495,16 +687,24 @@ mod tests {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Transpose", vec!["x"], vec!["y"]);
         add_ints_attribute(&mut node, "perm", vec![1, 0, 2]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "transpose");
-        assert_eq!(result[0].inputs, vec!["x"]);
-        assert!(result[0].options.contains_key("permutation"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "transpose");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert!(result.nodes[0].options.contains_key("permutation"));
     }
 
     #[test]
@@ -512,16 +712,24 @@ mod tests {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Concat", vec!["a", "b", "c"], vec!["result"]);
         add_int_attribute(&mut node, "axis", 1);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "concat");
-        assert_eq!(result[0].inputs.len(), 3);
-        assert!(result[0].options.contains_key("axis"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "concat");
+        assert_eq!(result.nodes[0].inputs.len(), 3);
+        assert!(result.nodes[0].options.contains_key("axis"));
     }
 
     #[test]
@@ -529,15 +737,23 @@ mod tests {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Split", vec!["x"], vec!["y1", "y2"]);
         add_int_attribute(&mut node, "axis", 0);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "split");
-        assert!(result[0].outputs.is_some());
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "split");
+        assert!(result.nodes[0].outputs.is_some());
     }
 
     #[test]
@@ -545,16 +761,24 @@ mod tests {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Unsqueeze", vec!["x"], vec!["y"]);
         add_ints_attribute(&mut node, "axes", vec![0, 2]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "expand");
-        assert_eq!(result[0].inputs, vec!["x"]);
-        assert!(result[0].options.contains_key("axes"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "expand");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert!(result.nodes[0].options.contains_key("axes"));
     }
 
     #[test]
@@ -562,15 +786,23 @@ mod tests {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Squeeze", vec!["x"], vec!["y"]);
         add_ints_attribute(&mut node, "axes", vec![1]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "reshape");
-        assert_eq!(result[0].inputs, vec!["x"]);
-        assert!(result[0].options.contains_key("axes"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "reshape");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert!(result.nodes[0].options.contains_key("axes"));
     }
 }

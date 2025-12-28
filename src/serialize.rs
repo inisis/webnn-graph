@@ -84,9 +84,8 @@ fn serialize_const_init(init: &ConstInit) -> String {
             format!(" @scalar({})", serialize_json_value(value))
         }
         ConstInit::InlineBytes { bytes } => {
-            // InlineBytes typically doesn't have a special annotation in the text format
-            // We'll serialize it without annotation (similar to default weights)
-            format!(" @bytes({:?})", bytes)
+            let nums: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+            format!(" @bytes([{}])", nums.join(", "))
         }
     }
 }

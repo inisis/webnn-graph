@@ -2,7 +2,7 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, OpHandler};
+use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use onnx::onnx::NodeProto;
 use serde_json::Map;
 
@@ -19,8 +19,8 @@ impl OpHandler for ReductionHandler {
     fn convert(
         &self,
         node: &NodeProto,
-        _context: &ConversionContext,
-    ) -> Result<Vec<Node>, OnnxError> {
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.get_op_type();
         let node_name = if node.has_name() {
             node.get_name().to_string()
@@ -29,10 +29,10 @@ impl OpHandler for ReductionHandler {
         };
 
         match op_type {
-            "ReduceMean" => self.convert_reduce(node, &node_name, "reduceMean"),
-            "ReduceSum" => self.convert_reduce(node, &node_name, "reduceSum"),
-            "ReduceMax" => self.convert_reduce(node, &node_name, "reduceMax"),
-            "ReduceMin" => self.convert_reduce(node, &node_name, "reduceMin"),
+            "ReduceMean" => self.convert_reduce(node, &node_name, "reduceMean", context),
+            "ReduceSum" => self.convert_reduce(node, &node_name, "reduceSum", context),
+            "ReduceMax" => self.convert_reduce(node, &node_name, "reduceMax", context),
+            "ReduceMin" => self.convert_reduce(node, &node_name, "reduceMin", context),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
                 node: node_name,
@@ -48,7 +48,8 @@ impl ReductionHandler {
         node: &NodeProto,
         node_name: &str,
         webnn_op: &str,
-    ) -> Result<Vec<Node>, OnnxError> {
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.is_empty() {
             return Err(OnnxError::InvalidShape(format!(
@@ -81,7 +82,7 @@ impl ReductionHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
 
         let mut options = Map::new();
 
@@ -96,13 +97,21 @@ impl ReductionHandler {
             serde_json::json!(keepdims != 0),
         );
 
-        Ok(vec![Node {
-            id: output_name,
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
             op: webnn_op.to_string(),
             inputs: vec![input0],
             options,
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 }
 
@@ -154,17 +163,25 @@ mod tests {
         let mut node = create_test_node("ReduceMean", vec!["x"], vec!["y"]);
         add_ints_attribute(&mut node, "axes", vec![1, 2]);
         add_int_attribute(&mut node, "keepdims", 1);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "reduceMean");
-        assert_eq!(result[0].inputs, vec!["x"]);
-        assert!(result[0].options.contains_key("axes"));
-        assert!(result[0].options.contains_key("keepDimensions"));
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "reduceMean");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert!(result.nodes[0].options.contains_key("axes"));
+        assert!(result.nodes[0].options.contains_key("keepDimensions"));
     }
 
     #[test]
@@ -172,13 +189,21 @@ mod tests {
         let handler = ReductionHandler;
         let mut node = create_test_node("ReduceSum", vec!["x"], vec!["y"]);
         add_ints_attribute(&mut node, "axes", vec![0]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "reduceSum");
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "reduceSum");
     }
 }

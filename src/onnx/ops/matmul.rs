@@ -1,8 +1,8 @@
 // MatMul and Gemm operator handlers
 
-use crate::ast::Node;
+use crate::ast::{ConstDecl, ConstInit, DataType, Node};
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, OpHandler};
+use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use onnx::onnx::NodeProto;
 use serde_json::Map;
 
@@ -17,7 +17,7 @@ impl OpHandler for MatMulHandler {
         &self,
         node: &NodeProto,
         _context: &ConversionContext,
-    ) -> Result<Vec<Node>, OnnxError> {
+    ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.get_op_type();
         let node_name = if node.has_name() {
             node.get_name().to_string()
@@ -26,8 +26,8 @@ impl OpHandler for MatMulHandler {
         };
 
         match op_type {
-            "MatMul" => self.convert_matmul(node, &node_name),
-            "Gemm" => self.convert_gemm(node, &node_name),
+            "MatMul" => self.convert_matmul(node, &node_name, _context),
+            "Gemm" => self.convert_gemm(node, &node_name, _context),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
                 node: node_name,
@@ -39,7 +39,12 @@ impl OpHandler for MatMulHandler {
 impl MatMulHandler {
     /// Convert ONNX MatMul to WebNN matmul
     /// MatMul: Y = A @ B
-    fn convert_matmul(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_matmul(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.len() != 2 {
             return Err(OnnxError::InvalidShape(format!(
@@ -54,22 +59,35 @@ impl MatMulHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
-        let input1 = sanitize_identifier(&inputs[1].to_string());
+        let input0 = context.resolve_input(&inputs[0]);
+        let input1 = context.resolve_input(&inputs[1]);
 
-        Ok(vec![Node {
+        let mut result = ConversionResult::new(vec![Node {
             id: output_name.clone(),
             op: "matmul".to_string(),
             inputs: vec![input0, input1],
             options: Map::new(),
             outputs: None,
-        }])
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 
     /// Convert ONNX Gemm to WebNN operations
     /// Gemm: Y = alpha * A' @ B' + beta * C
     /// where A' = transpose(A) if transA else A
-    fn convert_gemm(&self, node: &NodeProto, node_name: &str) -> Result<Vec<Node>, OnnxError> {
+    fn convert_gemm(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.get_input();
         if inputs.len() < 2 {
             return Err(OnnxError::InvalidShape(format!(
@@ -116,30 +134,54 @@ impl MatMulHandler {
             sanitize_identifier(&node.get_output()[0].to_string())
         };
 
-        let input0 = sanitize_identifier(&inputs[0].to_string());
-        let input1 = sanitize_identifier(&inputs[1].to_string());
-        let input2 = if inputs.len() > 2 {
-            sanitize_identifier(&inputs[2].to_string())
-        } else {
-            String::new()
-        };
+        let input0_raw = inputs[0].to_string();
+        let input1_raw = inputs[1].to_string();
+        let input2_raw = inputs.get(2).map(|s| s.to_string());
+
+        let input0 = context.resolve_input(&input0_raw);
+        let input1 = context.resolve_input(&input1_raw);
+        let input2 = input2_raw
+            .as_ref()
+            .map(|name| context.resolve_input(name))
+            .unwrap_or_default();
 
         let mut nodes = Vec::new();
-        let mut current_result = format!("{}_matmul", node_name);
+        let mut consts = Vec::new();
+        let mut current_result = sanitize_identifier(&format!("{}_matmul", node_name));
+
+        let build_transpose_perm = |input_name: &str,
+                                    value_shapes: &std::collections::HashMap<String, Vec<i64>>|
+         -> Result<Vec<i64>, OnnxError> {
+            if let Some(shape) = value_shapes.get(input_name) {
+                if shape.len() < 2 {
+                    return Err(OnnxError::InvalidShape(format!(
+                        "Gemm transpose requires rank >= 2 for '{}', got {:?}",
+                        input_name, shape
+                    )));
+                }
+                let rank = shape.len();
+                let mut perm: Vec<i64> = (0..rank as i64).collect();
+                perm.swap(rank - 1, rank - 2);
+                Ok(perm)
+            } else {
+                Err(OnnxError::InvalidShape(format!(
+                    "Gemm transpose requires known shape for '{}'",
+                    input_name
+                )))
+            }
+        };
 
         // Handle transpose A if needed
         let input_a = if trans_a {
-            let trans_a_name = format!("{}_transposeA", node_name);
+            let trans_a_name = sanitize_identifier(&format!("{}_transposeA", node_name));
+            let perm = build_transpose_perm(&input0_raw, context.value_shapes)?;
             nodes.push(Node {
                 id: trans_a_name.clone(),
                 op: "transpose".to_string(),
                 inputs: vec![input0.clone()],
                 options: {
                     let mut opts = Map::new();
-                    opts.insert(
-                        "permutation".to_string(),
-                        serde_json::json!([1, 0]), // Swap last two dimensions
-                    );
+                    opts.insert("permutation".to_string(), serde_json::json!(perm));
                     opts
                 },
                 outputs: None,
@@ -151,17 +193,15 @@ impl MatMulHandler {
 
         // Handle transpose B if needed
         let input_b = if trans_b {
-            let trans_b_name = format!("{}_transposeB", node_name);
+            let trans_b_name = sanitize_identifier(&format!("{}_transposeB", node_name));
+            let perm = build_transpose_perm(&input1_raw, context.value_shapes)?;
             nodes.push(Node {
                 id: trans_b_name.clone(),
                 op: "transpose".to_string(),
                 inputs: vec![input1.clone()],
                 options: {
                     let mut opts = Map::new();
-                    opts.insert(
-                        "permutation".to_string(),
-                        serde_json::json!([1, 0]), // Swap last two dimensions
-                    );
+                    opts.insert("permutation".to_string(), serde_json::json!(perm));
                     opts
                 },
                 outputs: None,
@@ -182,27 +222,48 @@ impl MatMulHandler {
 
         // Scale by alpha if not 1.0
         if (alpha - 1.0).abs() > f32::EPSILON {
-            let scaled = format!("{}_scaled", node_name);
+            let scaled = sanitize_identifier(&format!("{}_scaled", node_name));
+            let alpha_const_id = sanitize_identifier(&format!("{}_alpha", node_name));
+            consts.push((
+                alpha_const_id.clone(),
+                ConstDecl {
+                    data_type: DataType::Float32,
+                    shape: vec![],
+                    init: ConstInit::Scalar {
+                        value: serde_json::json!(alpha),
+                    },
+                },
+            ));
             nodes.push(Node {
                 id: scaled.clone(),
                 op: "mul".to_string(),
-                inputs: vec![current_result.clone(), format!("{}_alpha", node_name)],
+                inputs: vec![current_result.clone(), alpha_const_id],
                 options: Map::new(),
                 outputs: None,
             });
             current_result = scaled;
-            // Note: alpha constant would need to be added to the graph's consts
         }
 
         // Add beta * C if C is provided
         if inputs.len() > 2 {
             let bias_input = if (beta - 1.0).abs() > f32::EPSILON {
                 // Scale C by beta
-                let scaled_c = format!("{}_scaled_c", node_name);
+                let scaled_c = sanitize_identifier(&format!("{}_scaled_c", node_name));
+                let beta_const_id = sanitize_identifier(&format!("{}_beta", node_name));
+                consts.push((
+                    beta_const_id.clone(),
+                    ConstDecl {
+                        data_type: DataType::Float32,
+                        shape: vec![],
+                        init: ConstInit::Scalar {
+                            value: serde_json::json!(beta),
+                        },
+                    },
+                ));
                 nodes.push(Node {
                     id: scaled_c.clone(),
                     op: "mul".to_string(),
-                    inputs: vec![input2.clone(), format!("{}_beta", node_name)],
+                    inputs: vec![input2.clone(), beta_const_id],
                     options: Map::new(),
                     outputs: None,
                 });
@@ -229,7 +290,20 @@ impl MatMulHandler {
             }
         }
 
-        Ok(nodes)
+        let mut result = ConversionResult {
+            nodes,
+            consts,
+            output_mappings: std::collections::HashMap::new(),
+            output_types: std::collections::HashMap::new(),
+        };
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+        }
+
+        Ok(result)
     }
 }
 
@@ -263,30 +337,46 @@ mod tests {
     fn test_convert_matmul() {
         let handler = MatMulHandler;
         let node = create_test_node("MatMul", vec!["a", "b"], vec!["c"]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "matmul");
-        assert_eq!(result[0].inputs, vec!["a", "b"]);
-        assert_eq!(result[0].id, "c");
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "matmul");
+        assert_eq!(result.nodes[0].inputs, vec!["a", "b"]);
+        assert_eq!(result.nodes[0].id, "c");
     }
 
     #[test]
     fn test_convert_gemm_simple() {
         let handler = MatMulHandler;
         let node = create_test_node("Gemm", vec!["a", "b"], vec!["c"]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
-            initializers: std::collections::HashMap::new(),
-            value_shapes: std::collections::HashMap::new(),
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
         };
 
         let result = handler.convert(&node, &context).unwrap();
         // Simple Gemm without C, alpha=1, beta=1 should produce just matmul
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, "matmul");
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "matmul");
     }
 }
