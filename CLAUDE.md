@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Please keep prose line lengths at or below 120 characters when editing markdown/text files.
+
 ## Project Overview
 
 webnn-graph is a Rust implementation for a WebNN-oriented graph DSL. It provides a complete pipeline:
@@ -65,7 +67,8 @@ make help
 
 ## CLI Usage
 
-The binary is named `webnn-graph` with ten subcommands. **Most commands accept both .webnn and .json formats** (auto-detected).
+The binary is named `webnn-graph` with ten subcommands. **Most commands accept both .webnn and .json
+formats** (auto-detected).
 
 ### Graph Operations
 
@@ -138,7 +141,9 @@ This eliminates Shape, Gather, Concat operations that WebNN cannot support. The 
 - Reshape operations using constant values instead of runtime computation
 - 40-50% fewer nodes in complex transformer models
 
-**Why this is necessary**: WebNN's `reshape` operation requires the shape parameter to be a constant, not a dynamically computed value. ONNX models with dynamic shapes use `Shape→Gather→Concat→Reshape` patterns that must be resolved to static constants at conversion time.
+**Why this is necessary**: WebNN's `reshape` operation requires the shape parameter to be a constant, not a
+dynamically computed value. ONNX models with dynamic shapes use `Shape→Gather→Concat→Reshape` patterns that
+must be resolved to static constants at conversion time.
 
 Convert ONNX models to WebNN format:
 ```bash
@@ -213,7 +218,9 @@ webnn-graph create-manifest \
 
 ## Complete Workflow Example
 
-The DSL uses **.webnn as the primary format** (10x smaller than JSON). The DSL is designed for **complete separation of concerns**: graph structure is reusable, weights are external, and input data is provided at runtime.
+The DSL uses **.webnn as the primary format** (10x smaller than JSON). The DSL is designed for **complete
+separation of concerns**: graph structure is reusable, weights are external, and input data is provided at
+runtime.
 
 ### 1. Define Graph (Data-Agnostic)
 
