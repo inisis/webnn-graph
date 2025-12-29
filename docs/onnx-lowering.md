@@ -1,8 +1,6 @@
 # Reference: ONNX → WebNN Lowering
 
-This reference explains how `webnn-graph` lowers ONNX graphs into the WebNN DSL. It’s meant to be linked
-from the project docs so new contributors understand the constraints, the required simplification, and the
-operator mapping at a glance.
+This reference explains how `webnn-graph` lowers ONNX graphs into the WebNN DSL.
 
 ## Key concepts up front
 - **Shape inference**: collect and propagate concrete shapes for every value. Inputs and initializers seed
