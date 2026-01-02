@@ -1205,6 +1205,57 @@ impl OnnxConverter {
                             }
                         }
                     }
+                } else if op_type == "Range" {
+                    // Range(start, limit, delta) -> [start, start+delta, start+2*delta, ...]
+                    if node.get_input().len() == 3 {
+                        if let (Some(start_name), Some(limit_name), Some(delta_name)) = (
+                            node.get_input().first(),
+                            node.get_input().get(1),
+                            node.get_input().get(2),
+                        ) {
+                            if let (Some(start_vals), Some(limit_vals), Some(delta_vals)) = (
+                                const_values.get(start_name),
+                                const_values.get(limit_name),
+                                const_values.get(delta_name),
+                            ) {
+                                if !start_vals.is_empty()
+                                    && !limit_vals.is_empty()
+                                    && !delta_vals.is_empty()
+                                {
+                                    let start = start_vals[0];
+                                    let limit = limit_vals[0];
+                                    let delta = delta_vals[0];
+
+                                    let mut range_vals = Vec::new();
+                                    if delta > 0 {
+                                        let mut current = start;
+                                        while current < limit {
+                                            range_vals.push(current);
+                                            current += delta;
+                                        }
+                                    } else if delta < 0 {
+                                        let mut current = start;
+                                        while current > limit {
+                                            range_vals.push(current);
+                                            current += delta;
+                                        }
+                                    }
+
+                                    if let Some(out) = node.get_output().first() {
+                                        const_values.insert(out.to_string(), range_vals.clone());
+                                        let out_shape = vec![range_vals.len() as i64];
+                                        value_shapes
+                                            .entry(out.to_string())
+                                            .or_insert(out_shape.clone());
+                                        value_shapes
+                                            .entry(sanitize_identifier(out))
+                                            .or_insert(out_shape);
+                                        value_types.insert(out.to_string(), DataType::Int64);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1228,73 +1279,41 @@ impl OnnxConverter {
                         .unwrap_or(false)
                 });
 
-                if !all_scalar {
-                    // Fallback to normal conversion if any output is not a scalar constant
-                    let context = crate::onnx::ops::ConversionContext {
-                        initializers: &initializers_map,
-                        value_shapes: &value_shapes,
-                        const_values: &const_values,
-                        value_ids: &value_name_map,
-                        value_types: &value_types,
-                    };
+                // Handle scalar constants by emitting them inline
+                if all_scalar {
+                    for out in outputs {
+                        if let Some(values) = const_values.get(out) {
+                            let const_name = sanitize_identifier(out);
+                            let shape = Vec::new();
 
-                    let converted = registry.convert_node(onnx_node, &context)?;
+                            let decl = crate::ast::ConstDecl {
+                                data_type: DataType::Int64,
+                                shape,
+                                init: crate::ast::ConstInit::InlineBytes {
+                                    bytes: values[0].to_le_bytes().to_vec(),
+                                },
+                            };
 
-                    for (name, decl) in converted.consts {
-                        let decl_dtype = decl.data_type.clone();
-                        if let Some(existing) = self.graph.consts.get(&name) {
-                            if existing != &decl {
-                                return Err(OnnxError::InvalidShape(format!(
-                                    "Conflicting constant definitions for '{}'",
-                                    name
-                                )));
+                            if let Some(existing) = self.graph.consts.get(&const_name) {
+                                if existing != &decl {
+                                    return Err(OnnxError::InvalidShape(format!(
+                                        "Conflicting constant definitions for '{}'",
+                                        const_name
+                                    )));
+                                }
+                            } else {
+                                self.graph.consts.insert(const_name.clone(), decl);
                             }
-                        } else {
-                            self.graph.consts.insert(name.clone(), decl);
+
+                            value_name_map.insert(out.to_string(), const_name.clone());
+                            value_name_map.insert(const_name.clone(), const_name.clone());
+                            value_types.insert(out.to_string(), DataType::Int64);
+                            value_types.insert(const_name, DataType::Int64);
                         }
-                        value_name_map.insert(name.clone(), name.clone());
-                        value_types.insert(name.clone(), decl_dtype);
-                    }
-
-                    for (onnx_out, webnn_id) in converted.output_mappings {
-                        value_name_map.insert(onnx_out.clone(), webnn_id.clone());
-                        value_name_map.insert(sanitize_identifier(&onnx_out), webnn_id.clone());
-                    }
-
-                    self.graph.nodes.extend(converted.nodes);
-                    continue;
-                }
-
-                for out in outputs {
-                    if let Some(values) = const_values.get(out) {
-                        let const_name = sanitize_identifier(out);
-                        let shape = Vec::new();
-
-                        let decl = crate::ast::ConstDecl {
-                            data_type: DataType::Int64,
-                            shape,
-                            init: crate::ast::ConstInit::InlineBytes {
-                                bytes: values[0].to_le_bytes().to_vec(),
-                            },
-                        };
-
-                        if let Some(existing) = self.graph.consts.get(&const_name) {
-                            if existing != &decl {
-                                return Err(OnnxError::InvalidShape(format!(
-                                    "Conflicting constant definitions for '{}'",
-                                    const_name
-                                )));
-                            }
-                        } else {
-                            self.graph.consts.insert(const_name.clone(), decl);
-                        }
-
-                        value_name_map.insert(out.to_string(), const_name.clone());
-                        value_name_map.insert(const_name.clone(), const_name.clone());
-                        value_types.insert(out.to_string(), DataType::Int64);
-                        value_types.insert(const_name, DataType::Int64);
                     }
                 }
+                // For non-scalar constants (like Range output), skip the node entirely
+                // The constant values are already in const_values and will be handled later
                 continue;
             }
 
