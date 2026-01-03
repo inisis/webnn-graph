@@ -42,7 +42,7 @@ pub enum OnnxError {
 /// Sanitize ONNX identifiers for WebNN DSL compatibility
 /// Replaces problematic characters that would confuse the parser
 pub fn sanitize_identifier(name: &str) -> String {
-    name.replace("::", "__").replace([':', '.'], "_")
+    name.replace("::", "__").replace([':', '.', '/'], "_")
 }
 
 /// Infer output shape for an ONNX node based on its operation type and inputs
@@ -1084,6 +1084,45 @@ impl OnnxConverter {
                 }
             }
 
+            // If we know the input_ids shape (batch, seq), upgrade any lone hidden-dim
+            // tensors (length-1 shapes) to [batch, seq, hidden] to unblock downstream
+            // matmul/reshape resolution in decoder graphs that lost batch/seq dims.
+            if let Some(ids_shape) = value_shapes.get("input_ids") {
+                if ids_shape.len() == 2 {
+                    let (batch, seq) = (ids_shape[0], ids_shape[1]);
+                    let upgrades: Vec<(String, Vec<i64>)> = value_shapes
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            if v.len() == 1 && v[0] > 1 {
+                                Some((k.clone(), vec![batch, seq, v[0]]))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for (k, v) in upgrades {
+                        value_shapes.insert(k, v);
+                    }
+                }
+            }
+
+            eprintln!(
+                "[debug] layer_norm shape {:?}",
+                value_shapes.get("/decoder/block.0/layer.0/layer_norm/Mul_1_output_0")
+            );
+            eprintln!(
+                "[debug] matmul q shape {:?}",
+                value_shapes.get("/decoder/block.0/layer.0/SelfAttention/q/MatMul_output_0")
+            );
+            eprintln!(
+                "[debug] input_ids shape {:?}",
+                value_shapes.get("input_ids")
+            );
+            eprintln!(
+                "[debug] ln div shape {:?}",
+                value_shapes.get("/decoder/block.0/layer.0/layer_norm/Div_output_0")
+            );
+
             let consts_before = const_values.len();
 
             // Extend const value map for const-foldable shapes
@@ -1154,37 +1193,53 @@ impl OnnxConverter {
                             }
                         }
                     }
-                } else if op_type == "Concat" {
-                    let mut axis = 0i64;
-                    for attr in node.get_attribute() {
-                        if attr.get_name() == "axis" && attr.has_i() {
-                            axis = attr.get_i();
-                        }
-                    }
-
-                    if axis == 0 || axis == -1 {
-                        let mut combined = Vec::new();
-                        let mut all_known = true;
-                        for inp in node.get_input() {
-                            if let Some(vals) = const_values.get(inp) {
-                                combined.extend_from_slice(vals);
-                            } else {
-                                all_known = false;
-                                break;
+                } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div") {
+                    if node.get_input().len() >= 2 {
+                        if let (Some(a), Some(b), Some(out)) = (
+                            node.get_input().first().and_then(|i| const_values.get(i)),
+                            node.get_input().get(1).and_then(|i| const_values.get(i)),
+                            node.get_output().first(),
+                        ) {
+                            let mut result_vals = Vec::new();
+                            let (a_len, b_len) = (a.len(), b.len());
+                            let max_len = a_len.max(b_len);
+                            for idx in 0..max_len {
+                                let av = if a_len == 1 { a[0] } else { a[idx] };
+                                let bv = if b_len == 1 { b[0] } else { b[idx] };
+                                let v = match op_type {
+                                    "Add" => av + bv,
+                                    "Sub" => av - bv,
+                                    "Mul" => av * bv,
+                                    "Div" => {
+                                        if bv == 0 {
+                                            continue;
+                                        }
+                                        av / bv
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                result_vals.push(v);
                             }
-                        }
-
-                        if all_known {
-                            if let Some(out) = node.get_output().first() {
-                                const_values.insert(out.to_string(), combined.clone());
-                                let merged_shape = vec![combined.len() as i64];
+                            if !result_vals.is_empty() {
+                                const_values.insert(out.to_string(), result_vals.clone());
+                                let out_shape = if result_vals.len() == 1 {
+                                    Vec::new()
+                                } else {
+                                    vec![result_vals.len() as i64]
+                                };
                                 value_shapes
                                     .entry(out.to_string())
-                                    .or_insert(merged_shape.clone());
+                                    .or_insert(out_shape.clone());
                                 value_shapes
                                     .entry(sanitize_identifier(out))
-                                    .or_insert(merged_shape);
-                                value_types.insert(out.to_string(), DataType::Int64);
+                                    .or_insert(out_shape);
+                                if let Some(dtype) = node
+                                    .get_input()
+                                    .iter()
+                                    .find_map(|i| value_types.get(i).cloned())
+                                {
+                                    value_types.insert(out.to_string(), dtype);
+                                }
                             }
                         }
                     }
@@ -1254,6 +1309,40 @@ impl OnnxConverter {
                                     }
                                 }
                             }
+                        }
+                    }
+                } else if op_type == "Concat" {
+                    // Concatenate constant inputs (often used to build shape tensors)
+                    if let Some(out) = node.get_output().first() {
+                        let mut concatenated: Vec<i64> = Vec::new();
+                        let mut all_const = true;
+                        for inp in node.get_input() {
+                            if let Some(vals) = const_values.get(inp) {
+                                concatenated.extend_from_slice(vals);
+                            } else {
+                                all_const = false;
+                                break;
+                            }
+                        }
+
+                        // Handle axis=0 or axis=-1 (common for shape building)
+                        let axis = node
+                            .get_attribute()
+                            .iter()
+                            .find(|a| a.get_name() == "axis" && a.has_i())
+                            .map(|a| a.get_i())
+                            .unwrap_or(0);
+
+                        if all_const && (axis == 0 || axis == -1) {
+                            const_values.insert(out.to_string(), concatenated.clone());
+                            let out_shape = vec![concatenated.len() as i64];
+                            value_shapes
+                                .entry(out.to_string())
+                                .or_insert(out_shape.clone());
+                            value_shapes
+                                .entry(sanitize_identifier(out))
+                                .or_insert(out_shape);
+                            value_types.insert(out.to_string(), DataType::Int64);
                         }
                     }
                 } else if op_type == "ConstantOfShape" {
