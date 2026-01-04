@@ -14,6 +14,7 @@ pub mod matmul;
 pub mod normalization;
 pub mod reduction;
 pub mod reshape;
+pub mod scatter;
 pub mod utility;
 
 use activation::ActivationHandler;
@@ -25,6 +26,7 @@ use matmul::MatMulHandler;
 use normalization::NormalizationHandler;
 use reduction::ReductionHandler;
 use reshape::ReshapeHandler;
+use scatter::ScatterHandler;
 use utility::UtilityHandler;
 
 /// Context for operator conversion
@@ -57,6 +59,7 @@ impl<'a> ConversionContext<'a> {
 }
 
 /// Results of converting a single ONNX node
+#[derive(Default, Debug)]
 pub struct ConversionResult {
     pub nodes: Vec<Node>,
     pub consts: Vec<(String, ConstDecl)>,
@@ -109,6 +112,7 @@ impl OpRegistry {
             Box::new(UtilityHandler),
             Box::new(ReductionHandler),
             Box::new(ActivationHandler),
+            Box::new(ScatterHandler),
         ];
 
         OpRegistry { handlers }
