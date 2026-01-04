@@ -1393,6 +1393,94 @@ impl OnnxConverter {
                             }
                         }
                     }
+                } else if op_type == "Equal" {
+                    // Equal(a, b) -> boolean tensor (represented as i64: 1 for true, 0 for false)
+                    if node.get_input().len() >= 2 {
+                        if let (Some(a), Some(b), Some(out)) = (
+                            node.get_input().first().and_then(|i| const_values.get(i)),
+                            node.get_input().get(1).and_then(|i| const_values.get(i)),
+                            node.get_output().first(),
+                        ) {
+                            let mut result_vals = Vec::new();
+                            let (a_len, b_len) = (a.len(), b.len());
+                            let max_len = a_len.max(b_len);
+                            for idx in 0..max_len {
+                                let av = if a_len == 1 {
+                                    a[0]
+                                } else {
+                                    a.get(idx).copied().unwrap_or(0)
+                                };
+                                let bv = if b_len == 1 {
+                                    b[0]
+                                } else {
+                                    b.get(idx).copied().unwrap_or(0)
+                                };
+                                result_vals.push(if av == bv { 1 } else { 0 });
+                            }
+                            if !result_vals.is_empty() {
+                                const_values.insert(out.to_string(), result_vals.clone());
+                                let out_shape = if result_vals.len() == 1 {
+                                    Vec::new()
+                                } else {
+                                    vec![result_vals.len() as i64]
+                                };
+                                value_shapes
+                                    .entry(out.to_string())
+                                    .or_insert(out_shape.clone());
+                                value_shapes
+                                    .entry(sanitize_identifier(out))
+                                    .or_insert(out_shape);
+                                value_types.insert(out.to_string(), DataType::Int64);
+                            }
+                        }
+                    }
+                } else if op_type == "Where" {
+                    // Where(condition, x, y) -> select x where condition is true, y otherwise
+                    if node.get_input().len() >= 3 {
+                        if let (Some(cond), Some(x), Some(y), Some(out)) = (
+                            node.get_input().first().and_then(|i| const_values.get(i)),
+                            node.get_input().get(1).and_then(|i| const_values.get(i)),
+                            node.get_input().get(2).and_then(|i| const_values.get(i)),
+                            node.get_output().first(),
+                        ) {
+                            let mut result_vals = Vec::new();
+                            let (cond_len, x_len, y_len) = (cond.len(), x.len(), y.len());
+                            let max_len = cond_len.max(x_len).max(y_len);
+                            for idx in 0..max_len {
+                                let cond_v = if cond_len == 1 {
+                                    cond[0]
+                                } else {
+                                    cond.get(idx).copied().unwrap_or(0)
+                                };
+                                let x_v = if x_len == 1 {
+                                    x[0]
+                                } else {
+                                    x.get(idx).copied().unwrap_or(0)
+                                };
+                                let y_v = if y_len == 1 {
+                                    y[0]
+                                } else {
+                                    y.get(idx).copied().unwrap_or(0)
+                                };
+                                result_vals.push(if cond_v != 0 { x_v } else { y_v });
+                            }
+                            if !result_vals.is_empty() {
+                                const_values.insert(out.to_string(), result_vals.clone());
+                                let out_shape = if result_vals.len() == 1 {
+                                    Vec::new()
+                                } else {
+                                    vec![result_vals.len() as i64]
+                                };
+                                value_shapes
+                                    .entry(out.to_string())
+                                    .or_insert(out_shape.clone());
+                                value_shapes
+                                    .entry(sanitize_identifier(out))
+                                    .or_insert(out_shape);
+                                value_types.insert(out.to_string(), DataType::Int64);
+                            }
+                        }
+                    }
                 }
             }
 
