@@ -12,7 +12,18 @@ impl OpHandler for ActivationHandler {
     fn supports(&self, op_type: &str) -> bool {
         matches!(
             op_type,
-            "Relu" | "Gelu" | "Tanh" | "Sigmoid" | "Sqrt" | "Exp" | "Log" | "Abs" | "Neg" | "Erf"
+            "Relu"
+                | "Gelu"
+                | "Tanh"
+                | "Sigmoid"
+                | "Sqrt"
+                | "Exp"
+                | "Log"
+                | "Abs"
+                | "Neg"
+                | "Erf"
+                | "Cos"
+                | "Sin"
         )
     }
 
@@ -40,6 +51,8 @@ impl OpHandler for ActivationHandler {
             "Abs" => "abs",
             "Neg" => "neg",
             "Erf" => "erf",
+            "Cos" => "cos",
+            "Sin" => "sin",
             _ => {
                 return Err(OnnxError::UnsupportedOp {
                     op: op_type.to_string(),
@@ -129,6 +142,8 @@ mod tests {
         assert!(handler.supports("Abs"));
         assert!(handler.supports("Neg"));
         assert!(handler.supports("Erf"));
+        assert!(handler.supports("Cos"));
+        assert!(handler.supports("Sin"));
         assert!(!handler.supports("Add"));
     }
 
@@ -198,5 +213,49 @@ mod tests {
         let result = handler.convert(&node, &context).unwrap();
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].op, "gelu");
+    }
+
+    #[test]
+    fn test_convert_cos() {
+        let handler = ActivationHandler;
+        let node = create_test_node("Cos", vec!["x"], vec!["y"]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler.convert(&node, &context).unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "cos");
+    }
+
+    #[test]
+    fn test_convert_sin() {
+        let handler = ActivationHandler;
+        let node = create_test_node("Sin", vec!["x"], vec!["y"]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler.convert(&node, &context).unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "sin");
     }
 }
