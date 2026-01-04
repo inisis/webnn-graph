@@ -5,7 +5,7 @@ use crate::ast::{ConstDecl, ConstInit, DataType};
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use onnx::onnx::NodeProto;
-use serde_json::Map;
+use serde_json::{json, Map};
 
 pub struct UtilityHandler;
 
@@ -13,7 +13,7 @@ impl OpHandler for UtilityHandler {
     fn supports(&self, op_type: &str) -> bool {
         matches!(
             op_type,
-            "Shape" | "Gather" | "Slice" | "ConstantOfShape" | "Range"
+            "Shape" | "Gather" | "Slice" | "ConstantOfShape" | "Range" | "Trilu"
         )
     }
 
@@ -35,6 +35,7 @@ impl OpHandler for UtilityHandler {
             "Slice" => self.convert_slice(node, &node_name, context),
             "ConstantOfShape" => self.convert_constant_of_shape(node, &node_name, context),
             "Range" => self.convert_range(node, &node_name, context),
+            "Trilu" => self.convert_trilu(node, &node_name, context),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
                 node: node_name,
@@ -190,6 +191,79 @@ impl UtilityHandler {
                 .output_mappings
                 .insert(out.to_string(), output_name.clone());
             result.output_types.insert(out.to_string(), DataType::Int64);
+        }
+
+        Ok(result)
+    }
+
+    fn convert_trilu(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
+        let inputs = node.get_input();
+        if inputs.is_empty() {
+            return Err(OnnxError::InvalidShape(
+                "Trilu expects at least 1 input (data)".to_string(),
+            ));
+        }
+
+        if inputs.len() > 2 {
+            return Err(OnnxError::InvalidShape(format!(
+                "Trilu expects at most 2 inputs (data, k), got {}",
+                inputs.len()
+            )));
+        }
+
+        let mut upper = true;
+        for attr in node.get_attribute() {
+            if attr.get_name() == "upper" && attr.has_i() {
+                upper = attr.get_i() != 0;
+            }
+        }
+
+        let mut k: i64 = 0;
+        if inputs.len() == 2 {
+            let k_input = inputs[1].as_str();
+            if let Some(offset) = self.read_scalar_i64(k_input, context) {
+                k = offset;
+            } else {
+                return Err(OnnxError::InvalidShape(
+                    "Trilu k input must be a constant scalar for WebNN".to_string(),
+                ));
+            }
+        }
+
+        let output_name = if node.get_output().is_empty() {
+            format!("{}_output", node_name)
+        } else {
+            sanitize_identifier(&node.get_output()[0].to_string())
+        };
+
+        let input0 = context.resolve_input(&inputs[0]);
+
+        let mut options = Map::new();
+        options.insert("upper".to_string(), json!(upper));
+        options.insert("k".to_string(), json!(k));
+
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
+            op: "triangular".to_string(),
+            inputs: vec![input0],
+            options,
+            outputs: None,
+        }]);
+
+        if let Some(output) = node.get_output().first() {
+            result
+                .output_mappings
+                .insert(output.to_string(), output_name.clone());
+            if let Some(dtype) = context.value_types.get(&inputs[0]) {
+                result
+                    .output_types
+                    .insert(output.to_string(), dtype.clone());
+            }
         }
 
         Ok(result)
@@ -601,7 +675,9 @@ impl UtilityHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::DataType;
     use onnx::onnx::{AttributeProto, NodeProto};
+    use serde_json::json;
 
     fn create_test_node(op_type: &str, inputs: Vec<&str>, outputs: Vec<&str>) -> NodeProto {
         let mut node = NodeProto::new();
@@ -704,5 +780,63 @@ mod tests {
         assert_eq!(result.nodes[0].op, "slice");
         assert_eq!(result.nodes[0].inputs, vec!["x"]);
         assert!(result.nodes[0].options.contains_key("starts"));
+    }
+
+    #[test]
+    fn test_convert_trilu_defaults() {
+        let handler = UtilityHandler;
+        let node = create_test_node("Trilu", vec!["x"], vec!["y"]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let mut value_types = std::collections::HashMap::new();
+        value_types.insert("x".to_string(), DataType::Float32);
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler.convert(&node, &context).unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "triangular");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert_eq!(result.nodes[0].options.get("upper"), Some(&json!(true)));
+        assert_eq!(result.nodes[0].options.get("k"), Some(&json!(0)));
+        assert_eq!(result.output_mappings.get("y"), Some(&"y".to_string()));
+        assert_eq!(result.output_types.get("y"), Some(&DataType::Float32));
+    }
+
+    #[test]
+    fn test_convert_trilu_with_k_and_lower() {
+        let handler = UtilityHandler;
+        let mut node = create_test_node("Trilu", vec!["x", "k"], vec!["y"]);
+        add_int_attribute(&mut node, "upper", 0);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("k".to_string(), vec![2]);
+        let value_ids = std::collections::HashMap::new();
+        let mut value_types = std::collections::HashMap::new();
+        value_types.insert("x".to_string(), DataType::Float16);
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler.convert(&node, &context).unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "triangular");
+        assert_eq!(result.nodes[0].inputs, vec!["x"]);
+        assert_eq!(result.nodes[0].options.get("upper"), Some(&json!(false)));
+        assert_eq!(result.nodes[0].options.get("k"), Some(&json!(2)));
+        assert_eq!(result.output_mappings.get("y"), Some(&"y".to_string()));
+        assert_eq!(result.output_types.get("y"), Some(&DataType::Float16));
     }
 }

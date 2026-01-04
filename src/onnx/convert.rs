@@ -57,7 +57,7 @@ fn infer_shape(
     match op {
         // Unary operations that preserve shape
         "Cast" | "Relu" | "Tanh" | "Sigmoid" | "Erf" | "Softmax" | "Gelu" | "Exp" | "Log"
-        | "Abs" | "Neg" | "Sqrt" | "LayerNormalization" => {
+        | "Abs" | "Neg" | "Sqrt" | "LayerNormalization" | "Trilu" => {
             let ins = node.get_input();
             if ins.is_empty() {
                 return None;
